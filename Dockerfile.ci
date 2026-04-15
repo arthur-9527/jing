@@ -63,48 +63,21 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install core dependencies
-RUN pip install --no-cache-dir \
-    fastapi==0.109.0 \
-    uvicorn[standard]==0.27.0 \
-    python-multipart==0.0.6 \
-    websockets>=12.0 \
-    sqlalchemy[asyncio]==2.0.25 \
-    asyncpg>=0.29.0 \
-    pgvector>=0.3.0 \
-    pydantic>=2.10.0 \
-    pydantic-settings>=2.6.0 \
-    httpx>=0.27.0 \
-    python-dotenv>=1.0.0 \
-    loguru==0.7.3 \
-    tiktoken>=0.7.0 \
-    redis
+# Create constraints file to prevent numpy from being upgraded to 2.x
+# scipy 1.12.0 requires numpy 1.x, numpy 2.x causes compatibility issues
+RUN echo "numpy>=1.26.0,<2.0.0" > /app/constraints.txt && \
+    echo "scipy==1.12.0" >> /app/constraints.txt
 
-# Install audio/math dependencies
-RUN pip install --no-cache-dir \
-    numpy>=1.26.0 \
-    scipy==1.12.0 \
-    sounddevice>=0.5.0
+# Install dependencies from requirements.txt with constraints
+# This ensures numpy stays at 1.x even if other packages want to upgrade it
+RUN pip install --no-cache-dir --constraint /app/constraints.txt -r requirements.txt
 
-# Install ML dependencies (CPU version for smaller image)
-RUN pip install --no-cache-dir \
+# Install torch CPU version separately (requires special index)
+RUN pip install --no-cache-dir --constraint /app/constraints.txt \
     torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Then install sentence-transformers from PyPI
-RUN pip install --no-cache-dir \
-    sentence-transformers>=2.2.0
-
-# Install pipecat and related
-RUN pip install --no-cache-dir \
-    "pipecat-ai==0.0.107" \
-    "deepgram-sdk>=6.0.1,<7" \
-    "openai>=1.12.0" \
-    "cerebras-cloud-sdk>=0.0.1" \
-    "apscheduler>=3.10.0" \
-    "cryptography==42.0.0"
-
-# Install OpenCV (headless version)
-RUN pip install --no-cache-dir opencv-python-headless>=4.9.0
+# Verify numpy version is correct (must be 1.x for scipy compatibility)
+RUN python -c "import numpy; assert numpy.__version__.startswith('1.'), f'ERROR: numpy {numpy.__version__} is not 1.x, scipy 1.12.0 requires numpy 1.x'"
 
 # Copy application code
 COPY . .

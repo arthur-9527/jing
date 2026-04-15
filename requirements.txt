@@ -30,7 +30,8 @@ deepgram-sdk>=6.0.1,<7
 websockets>=14.1
 
 # Audio/Math
-numpy>=1.26.0
+# 注意: scipy 1.12.0 需要 numpy 1.x，不能使用 numpy 2.x
+numpy>=1.26.0,<2.0.0
 scipy==1.12.0
 sounddevice>=0.5.0
 PyAudio>=0.2.14

@@ -1,6 +1,7 @@
 # ========================================
 # Jing PostgreSQL Dockerfile
-# 包含: pgvector + zhparser 中文分词
+# 包含: pgvector 向量搜索扩展
+# 注意: 已移除 zhparser 中文分词（构建复杂度高）
 # ========================================
 # 构建命令: docker build -t hostname9527/jing-postgres:latest -f Dockerfile.postgres .
 # ========================================
@@ -9,44 +10,6 @@ FROM pgvector/pgvector:pg16
 
 # 设置工作目录
 WORKDIR /build
-
-# 安装编译工具和依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    wget \
-    bzip2 \
-    git \
-    curl \
-    postgresql-server-dev-16 \
-    && rm -rf /var/lib/apt/lists/*
-
-# ===========================================
-# 安装 scws (Simple Chinese Word Segmentation)
-# ===========================================
-RUN wget -q http://www.xunsearch.com/scws/down/scws-1.2.3.tar.bz2 \
-    && tar xjf scws-1.2.3.tar.bz2 \
-    && cd scws-1.2.3 \
-    && ./configure --prefix=/usr/local \
-    && make -j$(nproc) \
-    && make install \
-    && cd .. \
-    && rm -rf scws-1.2.3*
-
-# 下载 scws 中文词典
-RUN wget -q http://www.xunsearch.com/scws/down/scws-dict-chs-utf8.tar.bz2 \
-    && tar xjf scws-dict-chs-utf8.tar.bz2 \
-    && mv dict.utf8.xdb /usr/local/scws/etc/ \
-    && rm -rf scws-dict-chs-utf8*
-
-# ===========================================
-# 安装 zhparser (PostgreSQL 中文分词扩展)
-# ===========================================
-RUN git clone --depth 1 https://github.com/amutu/zhparser.git \
-    && cd zhparser \
-    && make SCWS_HOME=/usr/local PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config \
-    && make install SCWS_HOME=/usr/local PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config \
-    && cd .. \
-    && rm -rf zhparser
 
 # ===========================================
 # 复制数据库初始化脚本
