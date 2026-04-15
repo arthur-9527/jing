@@ -30,5 +30,5 @@ htmlcov/
 build/
 *.egg-info/
 
-# Documentation
-docs/
+# Models (embedding models are large, download separately)
+models/

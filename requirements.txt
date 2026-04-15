@@ -55,4 +55,4 @@ torch>=2.0.0  # sentence-transformers 依赖
 apscheduler>=3.10.0
 
 # =======redis
-redis >=5.0.0
+redis >=7.0.0
