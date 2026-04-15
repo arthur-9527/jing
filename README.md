@@ -49,22 +49,124 @@ Jing 是一个基于 FastAPI 的智能虚拟人后端服务，支持：
 | 磁盘空间 | ≥ 5GB | 镜像 + 数据 + 模型 |
 | 内存 | ≥ 4GB | 推荐 8GB+ |
 
-### 一键部署步骤
+---
+
+### 方式一：拉取镜像部署（推荐 ✨）
+
+**适用于生产环境，无需本地构建，开箱即用。**
+
+#### 步骤 1：创建部署目录
 
 ```bash
-# 1. 进入项目目录
+mkdir ~/jing && cd ~/jing
+```
+
+#### 步骤 2：拉取预构建镜像
+
+```bash
+docker pull hostname9527/jing:latest
+docker pull hostname9527/jing-postgres:latest
+```
+
+#### 步骤 3：下载部署配置文件
+
+```bash
+# 下载 docker-compose.deploy.yml
+wget https://raw.githubusercontent.com/arthur-9527/jing/main/docker-compose.deploy.yml
+
+# 或手动创建（如果网络受限）
+curl -LO https://raw.githubusercontent.com/arthur-9527/jing/main/docker-compose.deploy.yml
+```
+
+#### 步骤 4：创建配置文件
+
+```bash
+cat > .env << 'EOF'
+# ========================================
+# 数据库配置（用户自行设置账号密码）
+# ========================================
+POSTGRES_USER=myuser
+POSTGRES_PASSWORD=my_secure_password
+POSTGRES_DB=agent_backend
+
+# ========================================
+# API 配置（必须填写）
+# ========================================
+# 阿里云 DashScope（用于 ASR/TTS）
+DASHSCOPE_API_KEY=your-dashscope-api-key
+
+# LLM 服务配置
+LLM_PROVIDER=cerebras
+LLM_API_BASE_URL=http://your-llm-server:4000/v1
+LLM_API_KEY=your-llm-api-key
+LLM_MODEL=qwen3-chat
+
+# OpenClaw WebSocket（动作执行器）
+OPENCLAW_WS_URL=ws://host.docker.internal:18789/gateway
+OPENCLAW_WS_TOKEN=your-token
+
+# ========================================
+# Embedding 模型路径（本地路径）
+# ========================================
+EMBEDDING_MODEL_PATH=./models/embedding
+EOF
+```
+
+#### 步骤 5：下载 Embedding 模型
+
+```bash
+# 创建模型目录
+mkdir -p models/embedding
+
+# 使用 HuggingFace CLI 下载（需要 pip install huggingface_hub）
+huggingface-cli download BAAI/bge-small-zh-v1.5 --local-dir models/embedding
+
+# 或使用项目脚本
+wget https://raw.githubusercontent.com/arthur-9527/jing/main/scripts/download-embedding-model.sh
+chmod +x download-embedding-model.sh
+./download-embedding-model.sh
+```
+
+#### 步骤 6：启动服务
+
+```bash
+docker-compose -f docker-compose.deploy.yml up -d
+```
+
+#### 步骤 7：验证部署
+
+```bash
+# 检查服务状态
+docker-compose -f docker-compose.deploy.yml ps
+
+# 健康检查
+curl http://localhost:8000/health
+
+# 查看日志
+docker-compose -f docker-compose.deploy.yml logs -f jing
+```
+
+---
+
+### 方式二：本地构建部署
+
+**适用于开发环境或自定义修改。**
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/arthur-9527/jing.git
 cd jing
 
-# 2. 下载 Embedding 模型（首次部署需要）
+# 2. 下载 Embedding 模型
 ./scripts/download-embedding-model.sh
 
 # 3. 复制配置文件模板
 cp .env.example .env
 
-# 4. 编辑配置文件，填入必要的 API Keys
-vim .env  # 或使用其他编辑器
+# 4. 编辑配置文件
+vim .env
 
-# 5. 启动服务
+# 5. 启动服务（自动构建镜像）
 ./start.sh --build
 ```
 
@@ -393,7 +495,7 @@ pytest tests/test_ws_connection.py -v
 
 ## 📄 License
 
-本项目采用 [MIT License](LICENSE) 开源许可证。
+MIT License
 
 ## 🤝 贡献
 
