@@ -157,6 +157,9 @@ check_prerequisites() {
         fi
     fi
     
+    # 创建 buildx 缓存目录
+    mkdir -p /tmp/.buildx-cache /tmp/.buildx-cache-new
+    
     echo -e "${GREEN}前置条件检查通过${NC}"
     echo ""
 }

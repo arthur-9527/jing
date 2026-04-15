@@ -38,159 +38,193 @@ Jing 是一个基于 FastAPI 的智能虚拟人后端服务，支持：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 🚀 快速部署
+## 🚀 本地部署指南
+
+本指南介绍如何在本地环境部署 Jing 项目，使用 Conda 管理 Python 环境。
 
 ### 环境要求
 
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
-| Docker | ≥ 20.10 | 容器运行环境 |
-| Docker Compose | ≥ 2.0 | 服务编排工具 |
-| 磁盘空间 | ≥ 5GB | 镜像 + 数据 + 模型 |
-| 内存 | ≥ 4GB | 推荐 8GB+ |
+| Conda | Miniconda/Anaconda | Python 环境管理 |
+| PostgreSQL | ≥ 16 + pgvector | 数据库（需要 pgvector 扩展） |
+| Redis | ≥ 7.0 | 缓存服务 |
+| 磁盘空间 | ≥ 2GB | 模型 + 依赖 |
 
 ---
 
-### 方式一：拉取镜像部署（推荐 ✨）
+### 详细部署步骤
 
-**适用于生产环境，无需本地构建，开箱即用。**
-
-#### 步骤 1：创建部署目录
+#### 1. 创建 Conda 环境
 
 ```bash
-mkdir ~/jing && cd ~/jing
+conda create -n jing python=3.11 -y
+conda activate jing
 ```
 
-#### 步骤 2：拉取预构建镜像
+#### 2. 安装系统依赖
 
 ```bash
-docker pull hostname9527/jing:latest
-docker pull hostname9527/jing-postgres:latest
+# Ubuntu/Debian
+sudo apt update
+sudo apt install -y postgresql-16 postgresql-16-pgvector redis-server
+
+# 启动服务
+sudo systemctl start postgresql
+sudo systemctl start redis-server
 ```
 
-#### 步骤 3：下载部署配置文件
+#### 3. 创建数据库和用户
 
 ```bash
-# 下载 docker-compose.deploy.yml
-wget https://raw.githubusercontent.com/arthur-9527/jing/main/docker-compose.deploy.yml
-
-# 或手动创建（如果网络受限）
-curl -LO https://raw.githubusercontent.com/arthur-9527/jing/main/docker-compose.deploy.yml
-```
-
-#### 步骤 4：创建配置文件
-
-```bash
-cat > .env << 'EOF'
-# ========================================
-# 数据库配置（用户自行设置账号密码）
-# ========================================
-POSTGRES_USER=myuser
-POSTGRES_PASSWORD=my_secure_password
-POSTGRES_DB=agent_backend
-
-# ========================================
-# API 配置（必须填写）
-# ========================================
-# 阿里云 DashScope（用于 ASR/TTS）
-DASHSCOPE_API_KEY=your-dashscope-api-key
-
-# LLM 服务配置
-LLM_PROVIDER=cerebras
-LLM_API_BASE_URL=http://your-llm-server:4000/v1
-LLM_API_KEY=your-llm-api-key
-LLM_MODEL=qwen3-chat
-
-# OpenClaw WebSocket（动作执行器）
-OPENCLAW_WS_URL=ws://host.docker.internal:18789/gateway
-OPENCLAW_WS_TOKEN=your-token
-
-# ========================================
-# Embedding 模型路径（本地路径）
-# ========================================
-EMBEDDING_MODEL_PATH=./models/embedding
+sudo -u postgres psql << 'EOF'
+CREATE USER admin WITH PASSWORD 'your_password';
+CREATE DATABASE agent_backend OWNER admin;
+\c agent_backend
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 EOF
 ```
 
-#### 步骤 5：下载 Embedding 模型
+#### 4. 安装 zhparser 中文分词
+
+zhparser 是 PostgreSQL 中文分词扩展，用于聊天记录的全文搜索。
+
+##### 4.1 安装 scws 分词引擎
 
 ```bash
-# 创建模型目录
-mkdir -p models/embedding
-
-# 使用 HuggingFace CLI 下载（需要 pip install huggingface_hub）
-huggingface-cli download BAAI/bge-small-zh-v1.5 --local-dir models/embedding
-
-# 或使用项目脚本
-wget https://raw.githubusercontent.com/arthur-9527/jing/main/scripts/download-embedding-model.sh
-chmod +x download-embedding-model.sh
-./download-embedding-model.sh
+cd /tmp
+wget http://www.xunsearch.com/scws/down/scws-1.2.3.tar.bz2
+tar -xjf scws-1.2.3.tar.bz2
+cd scws-1.2.3
+./configure
+make
+sudo make install
 ```
 
-#### 步骤 6：启动服务
+##### 4.2 下载 UTF-8 词典
+
+项目使用 UTF-8 编码，需要下载 UTF-8 版本的词典：
 
 ```bash
-docker-compose -f docker-compose.deploy.yml up -d
+cd /tmp
+wget http://www.xunsearch.com/scws/down/scws-dict-chs-utf8.tar.bz2
+tar -xjf scws-dict-chs-utf8.tar.bz2
+sudo mkdir -p /usr/local/share/scws
+sudo cp dict.utf8.xdb /usr/local/share/scws/
 ```
 
-#### 步骤 7：验证部署
+##### 4.3 编译安装 zhparser
 
 ```bash
-# 检查服务状态
-docker-compose -f docker-compose.deploy.yml ps
+cd /tmp
+git clone https://github.com/amutu/zhparser.git
+cd zhparser
+export PATH=/usr/lib/postgresql/16/bin:$PATH
+make
+sudo make install
+```
 
-# 健康检查
-curl http://localhost:8000/health
+#### 5. 导入 SQL 脚本（按顺序）
 
-# 查看日志
-docker-compose -f docker-compose.deploy.yml logs -f jing
+```bash
+# 设置密码环境变量
+export PGPASSWORD=your_password
+
+# 1. 主数据库初始化（创建所有表）
+psql -U admin -d agent_backend -h localhost -f sql/init_db.sql
+
+# 2. 中文分词列（需要 zhparser）
+psql -U admin -d agent_backend -h localhost -f sql/add_chinese_fts_columns.sql
+
+# 3. 心跳 FTS 索引
+psql -U admin -d agent_backend -h localhost -f sql/add_heartbeat_fts.sql
+```
+
+#### 6. 安装 Python 依赖
+
+```bash
+conda activate jing
+pip install -r requirements.txt
+
+# 安装额外的 redis 包
+pip install redis
+```
+
+#### 7. 下载 Embedding 模型
+
+系统使用本地 Embedding 模型 `BAAI/bge-small-zh-v1.5`（约 100MB）：
+
+```bash
+./scripts/download-embedding-model.sh
+```
+
+模型将下载到 `models/embedding` 目录。
+
+#### 8. 创建配置文件
+
+复制项目中的 `.env.example` 为 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env` 文件，修改以下关键配置：
+
+##### 数据库配置（本地部署需要修改）
+
+```bash
+# 数据库连接 URL（注意使用 localhost）
+DATABASE_URL=postgresql+asyncpg://admin:your_password@localhost:5432/agent_backend
+
+# Redis 连接 URL
+REDIS_URL=redis://localhost:6379/0
+```
+
+##### Embedding 模型配置
+
+```bash
+LOCAL_EMBEDDING_ENABLED=true
+LOCAL_EMBEDDING_MODEL_PATH=models/embedding
+EMBEDDING_DIM=512
+```
+
+##### LLM API 配置（必需）
+
+```bash
+LLM_PROVIDER=cerebras
+LLM_API_BASE_URL=http://your-llm-server:4000/v1
+LLM_API_KEY=your_api_key
+LLM_MODEL=qwen3-chat
+```
+
+##### DashScope API（必需，用于 ASR/TTS）
+
+```bash
+DASHSCOPE_API_KEY=your_dashscope_key
+```
+
+##### OpenClaw WebSocket（必需）
+
+```bash
+OPENCLAW_WS_URL=ws://localhost:18789/gateway
+OPENCLAW_WS_TOKEN=your_token
+```
+
+#### 9. 启动服务
+
+```bash
+conda activate jing
+python main.py
+```
+
+或使用 uvicorn：
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ---
-
-### 方式二：本地构建部署
-
-**适用于开发环境或自定义修改。**
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/arthur-9527/jing.git
-cd jing
-
-# 2. 下载 Embedding 模型
-./scripts/download-embedding-model.sh
-
-# 3. 复制配置文件模板
-cp .env.example .env
-
-# 4. 编辑配置文件
-vim .env
-
-# 5. 启动服务（自动构建镜像）
-./start.sh --build
-```
-
-### 服务管理
-
-```bash
-# 启动服务（后台运行）
-./start.sh
-
-# 启动服务（重新构建镜像）
-./start.sh --build
-
-# 启动服务（开发模式，前台运行）
-./start.sh --dev
-
-# 停止服务
-./stop.sh
-
-# 停止服务并清理数据卷
-./stop.sh --clean
-
-# 查看日志
-docker-compose logs -f jing
-```
 
 ### 验证部署
 
@@ -213,11 +247,12 @@ open http://localhost:8000/docs
 
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
-| `POSTGRES_PASSWORD` | PostgreSQL 密码 | `your_secure_password` |
+| `DATABASE_URL` | PostgreSQL 连接 URL | `postgresql+asyncpg://admin:password@localhost:5432/agent_backend` |
+| `REDIS_URL` | Redis 连接 URL | `redis://localhost:6379/0` |
 | `DASHSCOPE_API_KEY` | 阿里云 DashScope API Key | `sk-xxx` |
 | `LLM_API_BASE_URL` | LLM 服务地址 | `http://your-llm-server:4000/v1` |
 | `LLM_API_KEY` | LLM API Key | `sk-xxx` |
-| `OPENCLAW_WS_URL` | OpenClaw WebSocket 地址 | `ws://host.docker.internal:18789/gateway` |
+| `OPENCLAW_WS_URL` | OpenClaw WebSocket 地址 | `ws://localhost:18789/gateway` |
 | `OPENCLAW_WS_TOKEN` | OpenClaw WebSocket Token | `your_token` |
 
 ### 可选配置项
@@ -240,7 +275,6 @@ open http://localhost:8000/docs
 ./scripts/download-embedding-model.sh
 
 # 模型将保存到 ./models/embedding 目录
-# Docker 会自动挂载到容器内
 ```
 
 ### 角色配置
@@ -285,136 +319,25 @@ config/characters/{character_id}/
 | `/` | 主前端页面 |
 | `/vmd` | VMD 上传管理页面 |
 
-## 🐳 Docker 配置
-
-### 多平台镜像支持
-
-Jing Docker 镜像支持以下平台：
-
-| 平台 | 架构 | 适用设备 |
-|------|------|----------|
-| `linux/amd64` | x86_64 | 通用服务器、云主机 |
-| `linux/arm64` | ARM64 | 树莓派 5、Apple Silicon Mac |
-
-```bash
-# 查看镜像支持的架构
-docker inspect hostname9527/jing:latest --format '{{.Architecture}}'
-
-# 拉取时会自动选择匹配当前设备的架构
-docker pull hostname9527/jing:latest
-```
-
----
-
-### 方式一：自动构建（GitHub Actions）✨
-
-**推荐用于正式发布**
-
-#### 配置 GitHub Secrets
-
-在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加：
-
-| Secret | 说明 |
-|--------|------|
-| `DOCKER_USERNAME` | Docker Hub 用户名 |
-| `DOCKER_PASSWORD` | Docker Hub Access Token（推荐） |
-
-#### 触发构建
-
-```bash
-# 推送标签触发自动构建
-git tag v1.0.0
-git push origin v1.0.0
-
-# 构建完成后自动推送到 Docker Hub
-# 镜像：hostname9527/jing:v1.0.0, hostname9527/jing:latest
-# 镜像：hostname9527/jing-postgres:v1.0.0, hostname9527/jing-postgres:latest
-```
-
-或手动触发：在 GitHub Actions 页面点击 "Run workflow"
-
----
-
-### 方式二：本地多平台构建
-
-**用于本地测试或手动发布**
-
-#### 前置准备
-
-```bash
-# 1. 安装 buildx
-docker buildx install
-
-# 2. 创建多平台 builder
-docker buildx create --name multiarch --use
-
-# 3. 登录 Docker Hub
-docker login
-```
-
-#### 使用构建脚本
-
-```bash
-# 构建所有镜像（不推送，仅本地测试）
-./scripts/build-multiarch.sh
-
-# 构建 Jing 镜像并推送到 Docker Hub
-./scripts/build-multiarch.sh -j -P
-
-# 构建 PostgreSQL 镜像并推送
-./scripts/build-multiarch.sh -p -P
-
-# 构建所有镜像，指定标签 v1.0.0，并推送
-./scripts/build-multiarch.sh --all --push --tag v1.0.0
-
-# 查看帮助
-./scripts/build-multiarch.sh --help
-```
-
----
-
-### 方式三：单平台构建（开发测试）
-
-**仅在当前平台构建，不支持多平台**
-
-```bash
-# 在项目父目录下构建（需要访问 frontend 和 vmd2sql）
-cd ..
-docker build -t jing:latest -f jing/Dockerfile .
-
-# 或使用 docker-compose
-cd jing
-docker-compose build --no-cache
-```
-
-### 手动运行
-
-```bash
-# 启动依赖服务
-docker-compose up -d postgres redis
-
-# 等待数据库就绪
-docker-compose logs -f postgres
-
-# 启动主服务
-docker-compose up -d jing
-```
-
-### 数据卷说明
-
-| 卷 | 容器路径 | 说明 |
-|----|----------|------|
-| `postgres_data` | `/var/lib/postgresql/data` | PostgreSQL 数据 |
-| `redis_data` | `/data` | Redis 数据 |
-| `./models/embedding` | `/app/models/embedding` | Embedding 模型 |
-| `./config` | `/app/config` | 角色配置 |
-| `./logs` | `/app/logs` | 日志文件 |
-| `./temp` | `/app/temp` | 临时文件 |
-
 ## 📁 目录结构
 
 ```
 jing/
+├── .env                    # 配置文件（从 .env.example 复制）
+├── .env.example            # 配置模板
+├── main.py                 # 应用入口
+├── requirements.txt        # Python 依赖
+├── models/
+│   └── embedding/          # Embedding 模型目录
+├── config/
+│   └── characters/         # 角色配置目录
+│       └── daji/           # 默认角色
+├── sql/
+│   ├── init_db.sql         # 主数据库初始化
+│   ├── add_chinese_fts_columns.sql  # 中文分词列
+│   └── add_heartbeat_fts.sql        # 心跳 FTS 索引
+├── scripts/
+│   └── download-embedding-model.sh  # 模型下载脚本
 ├── app/                      # 应用主目录
 │   ├── agent/               # Agent 核心
 │   │   ├── character/      # 角色加载器
@@ -438,13 +361,7 @@ jing/
 │       ├── playback/       # 播放管理
 │       ├── stt/            # 语音识别
 │       └── tts/            # 语音合成
-├── config/                  # 配置目录
-│   └── characters/         # 角色配置
-├── scripts/                 # 工具脚本
-├── sql/                     # SQL 脚本
 ├── tests/                   # 测试用例
-├── models/                  # 模型文件
-│   └── embedding/          # Embedding 模型
 ├── logs/                    # 日志目录
 ├── temp/                    # 临时文件
 ├── dist/                    # 主前端构建输出
@@ -453,26 +370,53 @@ jing/
 ├── docker-compose.yml      # 服务编排配置
 ├── start.sh                # 启动脚本
 ├── stop.sh                 # 停止脚本
-├── main.py                 # 应用入口
-├── requirements.txt        # Python 依赖
-└── .env.example            # 配置模板
+└── requirements.txt        # Python 依赖
 ```
 
 ## ❓ 常见问题
 
-### 1. 镜像构建失败：找不到 frontend 目录
+### PostgreSQL peer 认证失败
 
-**原因**：Dockerfile 需要在父目录构建，依赖 `frontend` 和 `vmd2sql/frontend` 项目。
+错误信息：`FATAL: Peer authentication failed for user "admin"`
 
-**解决**：
+**解决方案**：使用 `-h localhost` 参数通过 TCP 连接，避免 Unix socket 的 peer 认证：
+
 ```bash
-# 确保目录结构正确
-ls -la ../frontend ../vmd2sql/frontend
-
-# 或修改 docker-compose.yml 中的 context
+psql -U admin -d agent_backend -h localhost -f sql/init_db.sql
 ```
 
-### 2. Embedding 模型加载失败
+### 缺少 redis Python 包
+
+错误信息：`ModuleNotFoundError: No module named 'redis'`
+
+**解决方案**：
+
+```bash
+pip install redis
+```
+
+### content_tsv_cn 列不存在
+
+错误信息：`column "content_tsv_cn" does not exist`
+
+**解决方案**：需要先安装 zhparser 中文分词扩展，然后执行 `sql/add_chinese_fts_columns.sql`：
+
+```bash
+# 确认 zhparser 已安装
+psql -U admin -d agent_backend -h localhost -c "SELECT * FROM pg_extension WHERE extname='zhparser';"
+
+# 执行中文分词列 SQL
+psql -U admin -d agent_backend -h localhost -f sql/add_chinese_fts_columns.sql
+```
+
+### zhparser 安装失败
+
+确保：
+1. scws 已正确安装（`scws -h` 可查看帮助）
+2. UTF-8 词典已放置到 `/usr/local/share/scws/`
+3. PostgreSQL 开发包已安装（`postgresql-server-dev-16`）
+
+### Embedding 模型加载失败
 
 **原因**：模型文件未下载或路径不正确。
 
@@ -489,23 +433,23 @@ ls -la models/embedding/
 grep EMBEDDING_MODEL_PATH .env
 ```
 
-### 3. 数据库连接失败
+### 数据库连接失败
 
 **原因**：PostgreSQL 未就绪或密码不匹配。
 
 **解决**：
 ```bash
 # 检查 PostgreSQL 状态
-docker-compose logs postgres
+sudo systemctl status postgresql
 
 # 确认密码一致
-grep POSTGRES_PASSWORD .env
+grep DATABASE_URL .env
 
 # 重启数据库
-docker-compose restart postgres
+sudo systemctl restart postgresql
 ```
 
-### 4. OpenClaw WebSocket 连接失败
+### OpenClaw WebSocket 连接失败
 
 **原因**：OpenClaw 服务未启动或地址配置错误。
 
@@ -516,13 +460,9 @@ curl http://localhost:18789/health
 
 # 检查配置
 grep OPENCLAW_WS .env
-
-# Docker 内部访问宿主机
-# 使用 host.docker.internal 或 host-gateway
-OPENCLAW_WS_URL=ws://host.docker.internal:18789/gateway
 ```
 
-### 5. ASR/TTS 调用失败
+### ASR/TTS 调用失败
 
 **原因**：DashScope API Key 未配置或无效。
 
@@ -537,17 +477,18 @@ curl -X POST https://dashscope.aliyuncs.com/api/v1/services/audio/asr \
   ...
 ```
 
-### 6. 服务启动后健康检查失败
+### 服务启动后健康检查失败
 
 **原因**：依赖服务未就绪。
 
 **解决**：
 ```bash
 # 查看详细日志
-docker-compose logs -f jing
+# 根据启动方式查看日志
 
 # 检查所有服务状态
-docker-compose ps
+sudo systemctl status postgresql
+sudo systemctl status redis-server
 
 # 手动健康检查
 curl -v http://localhost:8000/health
@@ -580,6 +521,16 @@ pytest tests/
 # 运行特定测试
 pytest tests/test_ws_connection.py -v
 ```
+
+## 📄 SQL 文件说明
+
+| 文件 | 说明 | 依赖 |
+|------|------|------|
+| `sql/init_db.sql` | 主数据库初始化，创建所有表 | pgvector, uuid-ossp |
+| `sql/add_chinese_fts_columns.sql` | 添加中文全文搜索列 | zhparser |
+| `sql/add_heartbeat_fts.sql` | 添加心跳事件 FTS 索引 | init_db.sql |
+
+**导入顺序**：`init_db.sql` → `add_chinese_fts_columns.sql` → `add_heartbeat_fts.sql`
 
 ## 📄 License
 
