@@ -287,7 +287,95 @@ config/characters/{character_id}/
 
 ## 🐳 Docker 配置
 
-### 构建镜像
+### 多平台镜像支持
+
+Jing Docker 镜像支持以下平台：
+
+| 平台 | 架构 | 适用设备 |
+|------|------|----------|
+| `linux/amd64` | x86_64 | 通用服务器、云主机 |
+| `linux/arm64` | ARM64 | 树莓派 5、Apple Silicon Mac |
+
+```bash
+# 查看镜像支持的架构
+docker inspect hostname9527/jing:latest --format '{{.Architecture}}'
+
+# 拉取时会自动选择匹配当前设备的架构
+docker pull hostname9527/jing:latest
+```
+
+---
+
+### 方式一：自动构建（GitHub Actions）✨
+
+**推荐用于正式发布**
+
+#### 配置 GitHub Secrets
+
+在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加：
+
+| Secret | 说明 |
+|--------|------|
+| `DOCKER_USERNAME` | Docker Hub 用户名 |
+| `DOCKER_PASSWORD` | Docker Hub Access Token（推荐） |
+
+#### 触发构建
+
+```bash
+# 推送标签触发自动构建
+git tag v1.0.0
+git push origin v1.0.0
+
+# 构建完成后自动推送到 Docker Hub
+# 镜像：hostname9527/jing:v1.0.0, hostname9527/jing:latest
+# 镜像：hostname9527/jing-postgres:v1.0.0, hostname9527/jing-postgres:latest
+```
+
+或手动触发：在 GitHub Actions 页面点击 "Run workflow"
+
+---
+
+### 方式二：本地多平台构建
+
+**用于本地测试或手动发布**
+
+#### 前置准备
+
+```bash
+# 1. 安装 buildx
+docker buildx install
+
+# 2. 创建多平台 builder
+docker buildx create --name multiarch --use
+
+# 3. 登录 Docker Hub
+docker login
+```
+
+#### 使用构建脚本
+
+```bash
+# 构建所有镜像（不推送，仅本地测试）
+./scripts/build-multiarch.sh
+
+# 构建 Jing 镜像并推送到 Docker Hub
+./scripts/build-multiarch.sh -j -P
+
+# 构建 PostgreSQL 镜像并推送
+./scripts/build-multiarch.sh -p -P
+
+# 构建所有镜像，指定标签 v1.0.0，并推送
+./scripts/build-multiarch.sh --all --push --tag v1.0.0
+
+# 查看帮助
+./scripts/build-multiarch.sh --help
+```
+
+---
+
+### 方式三：单平台构建（开发测试）
+
+**仅在当前平台构建，不支持多平台**
 
 ```bash
 # 在项目父目录下构建（需要访问 frontend 和 vmd2sql）
