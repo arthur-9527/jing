@@ -4,6 +4,7 @@
 # 多平台 Docker 镜像构建工作流
 # 支持: linux/amd64, linux/arm64
 # 触发: 推送标签(v*) 或手动触发
+# 使用 Dockerfile.ci (跳过前端编译，使用预编译的 dist 目录)
 # ========================================
 
 name: Build Multi-Platform Docker Images
@@ -36,22 +37,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          # 需要获取父目录的前端项目
-          fetch-depth: 0
 
-      - name: Check for frontend directories
+      - name: Check for pre-built frontend directories
         run: |
-          echo "Checking for frontend directories..."
-          if [ -d "../frontend" ]; then
-            echo "Frontend directory found at ../frontend"
+          echo "Checking for pre-built frontend directories..."
+          if [ -d "./dist" ]; then
+            echo "Frontend dist directory found: ./dist"
+            ls -la ./dist
           else
-            echo "Warning: frontend directory not found"
+            echo "Error: ./dist directory not found"
+            exit 1
           fi
-          if [ -d "../vmd2sql/frontend" ]; then
-            echo "VMD2SQL frontend directory found at ../vmd2sql/frontend"
+          if [ -d "./dist-vmd2sql" ]; then
+            echo "VMD2SQL dist directory found: ./dist-vmd2sql"
+            ls -la ./dist-vmd2sql
           else
-            echo "Warning: vmd2sql/frontend directory not found"
+            echo "Error: ./dist-vmd2sql directory not found"
+            exit 1
           fi
 
       - name: Set up QEMU
@@ -82,17 +84,14 @@ jobs:
       - name: Build and push Jing image
         uses: docker/build-push-action@v5
         with:
-          context: ..
-          file: ./jing/Dockerfile
+          context: .
+          file: ./Dockerfile.ci
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_images == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VCS_REF=${{ github.sha }}
 
   build-postgres:
     name: Build PostgreSQL Image

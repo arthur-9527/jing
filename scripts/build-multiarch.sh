@@ -14,6 +14,7 @@
 #   -a, --all         构建所有镜像 (默认)
 #   -P, --push        构建后推送到 Docker Hub
 #   -t, --tag TAG     指定镜像标签 (默认: latest)
+#   -c, --ci          使用 Dockerfile.ci (跳过前端编译，用于 CI)
 #   -h, --help        显示帮助信息
 #
 # 前置要求:
@@ -34,6 +35,7 @@ TAG="latest"
 PUSH=false
 BUILD_JING=false
 BUILD_POSTGRES=false
+USE_CI_DOCKERFILE=false
 
 # 颜色输出
 RED='\033[0;31m'
@@ -56,6 +58,7 @@ show_help() {
     echo "  -a, --all         构建所有镜像 (默认)"
     echo "  -P, --push        构建后推送到 Docker Hub"
     echo "  -t, --tag TAG     指定镜像标签 (默认: latest)"
+    echo "  -c, --ci          使用 Dockerfile.ci (跳过前端编译)"
     echo "  -h, --help        显示帮助信息"
     echo ""
     echo "示例:"
@@ -96,6 +99,10 @@ parse_args() {
             -t|--tag)
                 TAG="$2"
                 shift 2
+                ;;
+            -c|--ci)
+                USE_CI_DOCKERFILE=true
+                shift
                 ;;
             -h|--help)
                 show_help
@@ -178,19 +185,32 @@ build_jing() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
     
-    # 检查 Dockerfile
-    if [[ ! -f "${PROJECT_ROOT}/jing/Dockerfile" ]]; then
-        # 可能是在 jing 目录下
-        if [[ -f "${PROJECT_ROOT}/Dockerfile" ]]; then
-            DOCKERFILE_PATH="${PROJECT_ROOT}/Dockerfile"
-            CONTEXT_PATH="$(dirname "$PROJECT_ROOT")"
+    # 根据 CI 模式选择 Dockerfile 和 context
+    if [[ "$USE_CI_DOCKERFILE" == "true" ]]; then
+        # CI 模式：使用 Dockerfile.ci，context 为当前目录
+        if [[ -f "${PROJECT_ROOT}/Dockerfile.ci" ]]; then
+            DOCKERFILE_PATH="${PROJECT_ROOT}/Dockerfile.ci"
+            CONTEXT_PATH="${PROJECT_ROOT}"
+            echo -e "${GREEN}使用 CI 模式: Dockerfile.ci${NC}"
         else
-            echo -e "${RED}错误: 找不到 Dockerfile${NC}"
+            echo -e "${RED}错误: 找不到 Dockerfile.ci${NC}"
             exit 1
         fi
     else
-        DOCKERFILE_PATH="${PROJECT_ROOT}/jing/Dockerfile"
-        CONTEXT_PATH="$(dirname "$PROJECT_ROOT")"
+        # 普通模式：使用完整 Dockerfile，context 为父目录
+        if [[ ! -f "${PROJECT_ROOT}/jing/Dockerfile" ]]; then
+            # 可能是在 jing 目录下
+            if [[ -f "${PROJECT_ROOT}/Dockerfile" ]]; then
+                DOCKERFILE_PATH="${PROJECT_ROOT}/Dockerfile"
+                CONTEXT_PATH="$(dirname "$PROJECT_ROOT")"
+            else
+                echo -e "${RED}错误: 找不到 Dockerfile${NC}"
+                exit 1
+            fi
+        else
+            DOCKERFILE_PATH="${PROJECT_ROOT}/jing/Dockerfile"
+            CONTEXT_PATH="$(dirname "$PROJECT_ROOT")"
+        fi
     fi
     
     echo -e "${BLUE}构建上下文: ${CONTEXT_PATH}${NC}"
