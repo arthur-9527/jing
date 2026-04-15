@@ -1,0 +1,7 @@
+{
+  "enabledPlugins": {
+    "pipecat@pipecat-skills": true,
+    "pipecat-cloud@pipecat-skills": true,
+    "pipecat-mcp-server@pipecat-skills": true
+  }
+}

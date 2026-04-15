@@ -1,0 +1,212 @@
+# ========================================
+# Jing 部署版 Docker Compose
+# ========================================
+# 使用预构建镜像，开箱即用
+# 
+# 使用方法:
+#   1. 创建 .env 文件配置账号密码和 API 密钥
+#   2. 启动: docker-compose -f docker-compose.deploy.yml up -d
+#   3. 查看日志: docker-compose -f docker-compose.deploy.yml logs -f
+#   4. 停止: docker-compose -f docker-compose.deploy.yml down
+# ========================================
+
+version: "3.8"
+
+services:
+  # ========== PostgreSQL Database ==========
+  postgres:
+    image: hostname9527/jing-postgres:latest
+    container_name: jing-postgres
+    restart: unless-stopped
+    environment:
+      # 用户自行配置账号密码
+      POSTGRES_USER: ${POSTGRES_USER:-jing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_backend}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jing} -d ${POSTGRES_DB:-agent_backend}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jing-network
+
+  # ========== Redis ==========
+  redis:
+    image: redis:7-alpine
+    container_name: jing-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jing-network
+
+  # ========== Jing Service ==========
+  jing:
+    image: hostname9527/jing:latest
+    container_name: jing
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Database (自动使用用户配置的账号密码)
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-jing}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-agent_backend}
+      
+      # Redis
+      REDIS_URL: redis://redis:6379/1
+      
+      # Server
+      HOST: 0.0.0.0
+      PORT: 8000
+      CORS_ORIGINS: "[\"*\"]"
+      
+      # Log level
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # Audio devices (disabled in Docker)
+      AUDIO_INPUT_DEVICE_INDEX: -1
+      AUDIO_OUTPUT_DEVICE_INDEX: -1
+      
+      # LLM Provider
+      LLM_PROVIDER: ${LLM_PROVIDER:-cerebras}
+      LLM_API_BASE_URL: ${LLM_API_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY:-sk-dummy}
+      LLM_MODEL: ${LLM_MODEL:-qwen3-chat}
+      
+      # Cerebras
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-sk-dummy}
+      CEREBRAS_MODEL: ${CEREBRAS_MODEL:-qwen3-chat}
+      CEREBRAS_API_BASE_URL: ${CEREBRAS_API_BASE_URL}
+      
+      # DashScope (阿里云 ASR/TTS)
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+      
+      # Embedding
+      LOCAL_EMBEDDING_ENABLED: ${LOCAL_EMBEDDING_ENABLED:-true}
+      LOCAL_EMBEDDING_MODEL_PATH: /app/models/embedding
+      EMBEDDING_DIM: 512
+      
+      # Agent
+      CHARACTER_CONFIG_PATH: ${CHARACTER_CONFIG_PATH:-config/characters/daji}
+      
+      # OpenClaw WebSocket
+      OPENCLAW_WS_URL: ${OPENCLAW_WS_URL:-ws://host.docker.internal:18789/gateway}
+      OPENCLAW_WS_TOKEN: ${OPENCLAW_WS_TOKEN}
+      OPENCLAW_SESSION_KEYS: ${OPENCLAW_SESSION_KEYS:-agent:main:chat1,agent:main:chat2}
+      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-300}
+      OPENCLAW_CLEAR_QUEUE_ON_START: ${OPENCLAW_CLEAR_QUEUE_ON_START:-true}
+      
+      # 二次改写
+      POST_PROCESS_ENABLED: ${POST_PROCESS_ENABLED:-true}
+      POST_PROCESS_PROVIDER: ${POST_PROCESS_PROVIDER:-litellm}
+      POST_PROCESS_MODEL: ${POST_PROCESS_MODEL:-qwen3-chat}
+      POST_PROCESS_BASE_URL: ${POST_PROCESS_BASE_URL:-${LLM_API_BASE_URL}}
+      POST_PROCESS_API_KEY: ${POST_PROCESS_API_KEY:-${LLM_API_KEY}}
+      POST_PROCESS_TIMEOUT: ${POST_PROCESS_TIMEOUT:-60.0}
+      
+      # Vision LLM
+      VISION_LLM_API_BASE_URL: ${VISION_LLM_API_BASE_URL}
+      VISION_LLM_API_KEY: ${VISION_LLM_API_KEY:-sk-dummy}
+      VISION_LLM_MODEL: ${VISION_LLM_MODEL:-ali-qwen3.5-plus}
+      
+      # ASR Provider
+      ASR_PROVIDER: ${ASR_PROVIDER:-qwen}
+      
+      # TTS Provider
+      TTS_PROVIDER: ${TTS_PROVIDER:-cosyvoice_ws}
+      
+      # Qwen ASR
+      QWEN_ASR_MODEL: ${QWEN_ASR_MODEL:-qwen3-asr-flash-realtime}
+      QWEN_ASR_LANGUAGE: ${QWEN_ASR_LANGUAGE:-zh}
+      QWEN_ASR_ENABLE_VAD: ${QWEN_ASR_ENABLE_VAD:-true}
+      QWEN_ASR_VAD_THRESHOLD: ${QWEN_ASR_VAD_THRESHOLD:-0.5}
+      QWEN_ASR_VAD_SILENCE_MS: ${QWEN_ASR_VAD_SILENCE_MS:-300}
+      
+      # CosyVoice TTS
+      COSYVOICE_WS_MODEL: ${COSYVOICE_WS_MODEL:-cosyvoice-v3-flash}
+      COSYVOICE_WS_CLONE_AUDIO: ${COSYVOICE_WS_CLONE_AUDIO:-config/characters/daji/daji.mp3}
+      
+      # Audio
+      AUDIO_SAMPLE_RATE: 16000
+      TTS_SAMPLE_RATE: 16000
+      
+      # Frame
+      FRAME_TARGET_FPS: 30
+      FRAME_BATCH_SIZE: 1
+      FRAME_BUFFER_SIZE: 300
+      
+      # Lipsync
+      LIPSYNC_DELAY_MS: 80
+      
+      # Idle
+      IDLE_LOW_WATER_MARK: 5
+      IDLE_TRANSITION_FRAMES: 10
+      
+      # Motion
+      MOTION_TRANSITION_FRAMES: 5
+      MOTION_HEAD_OFFSET_FRAMES: 5
+      
+      # Cache heartbeat
+      CACHE_HEARTBEAT_ENABLED: true
+      CACHE_HEARTBEAT_INTERVAL: 240
+      
+      # Speculative sampling
+      SPECULATIVE_SAMPLING_ENABLED: true
+      
+      # Action parse
+      ACTION_PARSE_TIMEOUT: 8.0
+      ACTION_PARSE_USE_FAST: true
+      
+      # Scheduler
+      SCHEDULER_ENABLED: true
+      
+    volumes:
+      # Embedding 模型（用户需下载或挂载）
+      - ${EMBEDDING_MODEL_PATH:-./models/embedding}:/app/models/embedding:ro
+      
+      # 人物配置目录
+      - ./config:/app/config:ro
+      
+      # 临时文件和日志
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+      
+    ports:
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    networks:
+      - jing-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# ========== Networks ==========
+networks:
+  jing-network:
+    driver: bridge
+
+# ========== Volumes ==========
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local

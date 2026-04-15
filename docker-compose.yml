@@ -1,0 +1,245 @@
+# ========================================
+# Jing Docker Compose
+# ========================================
+# 使用方法:
+#   启动: docker-compose up -d --build
+#   停止: docker-compose down
+#   查看日志: docker-compose logs -f jing
+#   重启: docker-compose restart jing
+#
+# 注意: 构建时需要访问父目录的前端项目
+# ========================================
+
+version: "3.8"
+
+services:
+  # ========== PostgreSQL Database ==========
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Aa123578964}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_backend}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-agent_backend}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jing-network
+
+  # ========== Redis ==========
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jing-network
+
+  # ========== Jing Service ==========
+  jing:
+    build:
+      # 构建上下文设置为父目录，以便访问 frontend 和 vmd2sql
+      context: ..
+      dockerfile: jing/Dockerfile
+    image: jing:latest
+    container_name: jing
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-Aa123578964}@postgres:5432/${POSTGRES_DB:-agent_backend}
+      
+      # Redis
+      REDIS_URL: redis://redis:6379/1
+      
+      # Server
+      HOST: 0.0.0.0
+      PORT: 8000
+      CORS_ORIGINS: "[\"*\"]"
+      
+      # Log level
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # Audio devices (disabled in Docker)
+      AUDIO_INPUT_DEVICE_INDEX: -1
+      AUDIO_OUTPUT_DEVICE_INDEX: -1
+      
+      # LLM Provider
+      LLM_PROVIDER: ${LLM_PROVIDER:-cerebras}
+      LLM_API_BASE_URL: ${LLM_API_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY:-sk-dummy}
+      LLM_MODEL: ${LLM_MODEL:-qwen3-chat}
+      
+      # Cerebras
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-sk-dummy}
+      CEREBRAS_MODEL: ${CEREBRAS_MODEL:-qwen3-chat}
+      CEREBRAS_API_BASE_URL: ${CEREBRAS_API_BASE_URL}
+      
+      # DashScope (阿里云 ASR/TTS)
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+      
+      # Embedding (容器内路径)
+      LOCAL_EMBEDDING_ENABLED: ${LOCAL_EMBEDDING_ENABLED:-true}
+      LOCAL_EMBEDDING_MODEL_PATH: /app/models/embedding
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-512}
+      
+      # Agent
+      CHARACTER_CONFIG_PATH: ${CHARACTER_CONFIG_PATH:-config/characters/daji}
+      
+      # OpenClaw WebSocket
+      OPENCLAW_WS_URL: ${OPENCLAW_WS_URL:-ws://host.docker.internal:18789/gateway}
+      OPENCLAW_WS_TOKEN: ${OPENCLAW_WS_TOKEN}
+      OPENCLAW_SESSION_KEYS: ${OPENCLAW_SESSION_KEYS:-agent:main:chat1,agent:main:chat2}
+      OPENCLAW_TIMEOUT: ${OPENCLAW_TIMEOUT:-300}
+      OPENCLAW_CLEAR_QUEUE_ON_START: ${OPENCLAW_CLEAR_QUEUE_ON_START:-true}
+      
+      # 二次改写
+      POST_PROCESS_ENABLED: ${POST_PROCESS_ENABLED:-true}
+      POST_PROCESS_PROVIDER: ${POST_PROCESS_PROVIDER:-litellm}
+      POST_PROCESS_MODEL: ${POST_PROCESS_MODEL:-qwen3-chat}
+      POST_PROCESS_BASE_URL: ${POST_PROCESS_BASE_URL:-${LLM_API_BASE_URL}}
+      POST_PROCESS_API_KEY: ${POST_PROCESS_API_KEY:-${LLM_API_KEY}}
+      POST_PROCESS_TIMEOUT: ${POST_PROCESS_TIMEOUT:-60.0}
+      
+      # Vision LLM
+      VISION_LLM_API_BASE_URL: ${VISION_LLM_API_BASE_URL}
+      VISION_LLM_API_KEY: ${VISION_LLM_API_KEY:-sk-dummy}
+      VISION_LLM_MODEL: ${VISION_LLM_MODEL:-ali-qwen3.5-plus}
+      
+      # ASR Provider
+      ASR_PROVIDER: ${ASR_PROVIDER:-qwen}
+      
+      # TTS Provider
+      TTS_PROVIDER: ${TTS_PROVIDER:-cosyvoice_ws}
+      
+      # Qwen ASR
+      QWEN_ASR_MODEL: ${QWEN_ASR_MODEL:-qwen3-asr-flash-realtime}
+      QWEN_ASR_LANGUAGE: ${QWEN_ASR_LANGUAGE:-zh}
+      QWEN_ASR_ENABLE_VAD: ${QWEN_ASR_ENABLE_VAD:-true}
+      QWEN_ASR_VAD_THRESHOLD: ${QWEN_ASR_VAD_THRESHOLD:-0.5}
+      QWEN_ASR_VAD_SILENCE_MS: ${QWEN_ASR_VAD_SILENCE_MS:-300}
+      
+      # CosyVoice TTS
+      COSYVOICE_WS_MODEL: ${COSYVOICE_WS_MODEL:-cosyvoice-v3-flash}
+      # 克隆音频路径（相对于容器内 config/characters 目录）
+      COSYVOICE_WS_CLONE_AUDIO: ${COSYVOICE_WS_CLONE_AUDIO:-config/characters/daji/daji.mp3}
+      
+      # Deepgram (可选)
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      DEEPGRAM_ASR_MODEL: ${DEEPGRAM_ASR_MODEL:-nova-2-general}
+      DEEPGRAM_ASR_LANGUAGE: ${DEEPGRAM_ASR_LANGUAGE:-zh-CN}
+      
+      # Cartesia TTS (可选)
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID:-}
+      CARTESIA_MODEL: ${CARTESIA_MODEL:-sonic-3}
+      CARTESIA_SAMPLE_RATE: ${CARTESIA_SAMPLE_RATE:-16000}
+      
+      # Audio
+      AUDIO_SAMPLE_RATE: ${AUDIO_SAMPLE_RATE:-16000}
+      TTS_SAMPLE_RATE: ${TTS_SAMPLE_RATE:-16000}
+      
+      # Frame
+      FRAME_TARGET_FPS: ${FRAME_TARGET_FPS:-30}
+      FRAME_BATCH_SIZE: ${FRAME_BATCH_SIZE:-1}
+      FRAME_BUFFER_SIZE: ${FRAME_BUFFER_SIZE:-300}
+      
+      # Lipsync
+      LIPSYNC_DELAY_MS: ${LIPSYNC_DELAY_MS:-80}
+      
+      # Idle
+      IDLE_LOW_WATER_MARK: ${IDLE_LOW_WATER_MARK:-5}
+      IDLE_TRANSITION_FRAMES: ${IDLE_TRANSITION_FRAMES:-10}
+      
+      # Motion
+      MOTION_TRANSITION_FRAMES: ${MOTION_TRANSITION_FRAMES:-5}
+      MOTION_HEAD_OFFSET_FRAMES: ${MOTION_HEAD_OFFSET_FRAMES:-5}
+      
+      # Cache heartbeat
+      CACHE_HEARTBEAT_ENABLED: ${CACHE_HEARTBEAT_ENABLED:-true}
+      CACHE_HEARTBEAT_INTERVAL: ${CACHE_HEARTBEAT_INTERVAL:-240}
+      
+      # Speculative sampling
+      SPECULATIVE_SAMPLING_ENABLED: ${SPECULATIVE_SAMPLING_ENABLED:-true}
+      
+      # Action parse
+      ACTION_PARSE_TIMEOUT: ${ACTION_PARSE_TIMEOUT:-8.0}
+      ACTION_PARSE_USE_FAST: ${ACTION_PARSE_USE_FAST:-true}
+      
+      # VMD Upload
+      VMD_UPLOAD_MAX_SIZE: ${VMD_UPLOAD_MAX_SIZE:-104857600}
+      VMD_VIDEO_MAX_SIZE: ${VMD_VIDEO_MAX_SIZE:-524288000}
+      VMD_UPLOAD_TEMP_DIR: /tmp/vmd_uploads
+      VMD_UPLOAD_TTL_HOURS: ${VMD_UPLOAD_TTL_HOURS:-24}
+      
+      # Graceful shutdown
+      GRACEFUL_SHUTDOWN_TIMEOUT: ${GRACEFUL_SHUTDOWN_TIMEOUT:-30}
+      
+      # Conversation
+      CONVERSATION_WINDOW_SIZE: ${CONVERSATION_WINDOW_SIZE:-5}
+      EMOTION_INTENSITY_THRESHOLD: ${EMOTION_INTENSITY_THRESHOLD:-0.05}
+      
+      # Embedding cache
+      EMBEDDING_CACHE_TTL: ${EMBEDDING_CACHE_TTL:-300}
+      EMBEDDING_CACHE_MAX: ${EMBEDDING_CACHE_MAX:-1000}
+      
+      # Scheduler
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      
+    volumes:
+      # Embedding 模型（用户需下载或挂载）
+      - ${EMBEDDING_MODEL_PATH:-./models/embedding}:/app/models/embedding:ro
+      
+      # 人物配置目录（包含模型和音频）
+      - ./config:/app/config:ro
+      
+      # 临时文件和日志
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+      
+    ports:
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    networks:
+      - jing-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# ========== Networks ==========
+networks:
+  jing-network:
+    driver: bridge
+
+# ========== Volumes ==========
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
