@@ -12,6 +12,9 @@ from datetime import datetime
 from typing import Any, Callable, Optional, Union
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# ⭐ 将 APScheduler 日志级别设置为 INFO（关闭 DEBUG 日志）
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger

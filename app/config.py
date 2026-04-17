@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["*"]
 
     # 应用配置
-    APP_NAME: str = "Jing"
+    APP_NAME: str = "MMD Agent Backend"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 

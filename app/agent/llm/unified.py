@@ -103,23 +103,20 @@ def _parse_t_tag(text: str) -> dict:
     return result
 
 
-def _parse_a_tag(text: str) -> str | None:
-    """从 <a> 标签内容中解析动作信息
+def _extract_a_tag_content(text: str) -> str | None:
+    """从 <a> 标签内容中提取动作数据
     
     Args:
-        text: <a> 标签内的内容，预期是 JSON 格式
+        text: <a> 标签内的内容
         
     Returns:
-        action_name 字符串或 None
+        原始 <a>...</a> 字符串或 None
     """
-    text = text.strip()
-    logger.debug("[A标签] 解析内容: %s", text[:200])
-    
-    # 直接返回内容（可能是 JSON 或纯文本）
-    if text:
-        logger.info("[A标签] 提取到动作: %s", text)
-        return text
-    
+    # 检查是否包含完整的 <a>...</a> 标签
+    import re
+    match = re.search(r'<a>.*?</a>', text, re.DOTALL)
+    if match:
+        return match.group(0)
     return None
 
 
@@ -397,7 +394,7 @@ async def generate_unified_stream(
     Yields:
         文本片段或字典:
         - str  台词片段（优先输出）
-        - {"type": "action", "action_name": str, "trigger_char": str}  动作触发
+        - {"type": "action_data", "action_data": str, "trigger_context": str}  动作数据
         - {"type": "emotion_delta", "emotion_delta": dict}  ⭐ 解析完 <t> 标签时立即输出（用于 TTS 情绪设置）
         - {"type": "tool_prompt", "tool_prompt": str|None}  解析完 <t> 标签时
         - {"type": "meta", ...}  解析完 <m> 标签时（流结束时）
@@ -437,8 +434,8 @@ async def generate_unified_stream(
     current_tag: str | None = None  # 当前标签类型（'t', 'a', 'm'）
     tag_buffer = ""                 # 标签内容缓存
     
-    # 待触发的动作
-    pending_action_name: str | None = None
+    # 待触发的动作（原始 <a>...</a> 字符串）
+    pending_action_data: str | None = None
     
     # T 标签缓存（延迟解析，流结束后输出 tool_prompt）
     cached_t_content: str = ""
@@ -456,7 +453,7 @@ async def generate_unified_stream(
 
     def _flush_output():
         """输出缓冲区的内容"""
-        nonlocal output_buffer, pending_action_name
+        nonlocal output_buffer, pending_action_data
         if not output_buffer:
             return
         
@@ -470,20 +467,24 @@ async def generate_unified_stream(
             output_buffer = ""
             return
         
-        # 如果有待触发动作，先输出动作字典
-        if pending_action_name:
-            trigger_char = None
+        # 如果有待触发动作，输出动作数据
+        if pending_action_data:
+            # 提取 trigger_context（前5个非空字符）
+            chars = []
             for ch in text:
                 if not ch.isspace():
-                    trigger_char = ch
-                    break
-            if trigger_char:
-                yield {
-                    "type": "action",
-                    "action_name": pending_action_name,
-                    "trigger_char": trigger_char,
-                }
-                pending_action_name = None
+                    chars.append(ch)
+                    if len(chars) >= 5:
+                        break
+            trigger_context = "".join(chars)
+            trigger_char = trigger_context[0] if trigger_context else ""
+            
+            yield {
+                "type": "action_data",
+                "action_data": pending_action_data,
+                "trigger_context": trigger_context,
+            }
+            pending_action_data = None
         
         yield text
         output_buffer = ""
@@ -491,7 +492,7 @@ async def generate_unified_stream(
     def _process_char(ch: str):
         """处理单个字符（状态机核心逻辑）"""
         nonlocal state, pending_chars, current_tag, tag_buffer, output_buffer
-        nonlocal cached_t_content, cached_m_content, pending_action_name
+        nonlocal cached_t_content, cached_m_content, pending_action_data
         
         if state == ParserState.NORMAL:
             if ch == '<':
@@ -579,12 +580,13 @@ async def generate_unified_stream(
                     pending_emotion_delta = t_data.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
                     logger.info("[状态机] T标签完成，emotion_delta=%s（立即输出）", pending_emotion_delta)
                 elif current_tag == 'a':
-                    action_name = _parse_a_tag(content)
-                    if action_name:
-                        if pending_action_name:
-                            logger.warning("[状态机] 动作标签未匹配触发字，已被覆盖: %s", pending_action_name)
-                        pending_action_name = action_name
-                        logger.info("[状态机] 提取动作标签: %s", action_name)
+                    # 直接存储原始 <a>...</a> 字符串
+                    action_data = f"<a>{content}</a>"
+                    if action_data:
+                        if pending_action_data:
+                            logger.warning("[状态机] 动作标签未匹配触发字，已被覆盖: %s", pending_action_data)
+                        pending_action_data = action_data
+                        logger.info("[状态机] 提取动作数据: %s", action_data[:50])
                 elif current_tag == 'm':
                     cached_m_content = content
                     logger.debug("[状态机] M标签内容已缓存")

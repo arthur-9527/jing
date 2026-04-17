@@ -43,6 +43,19 @@ import websockets
 from app.services.text_utils import is_valid_asr_input
 
 
+# ⭐ 自定义帧：无效转录事件（用于通知 StateManager 恢复到 IDLE）
+class TranscriptionFilteredFrame(Frame):
+    """转录被过滤事件帧
+    
+    当 ASR 检测到无效转录（如单字语气词"嗯"、"啊"）时广播此帧。
+    StateManager 收到此帧后应从 THINKING 状态恢复到 IDLE。
+    """
+    def __init__(self, text: str = "", reason: str = "filtered"):
+        super().__init__()
+        self.text = text
+        self.reason = reason
+
+
 # WebSocket URL - 北京地域
 QWEN_ASR_WS_URL_BEIJING = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 # WebSocket URL - 新加坡地域
@@ -492,6 +505,7 @@ class QwenASRService(WebsocketSTTService):
 
         这是最终识别结果的关键事件。
         ⭐ 在推送帧之前进行有效性过滤，防止无效输入进入 Redis 和后续流程。
+        ⭐ 无效转录时广播 TranscriptionFilteredFrame，通知 StateManager 恢复到 IDLE。
         """
         transcript = data.get("transcript", "")
 
@@ -503,6 +517,9 @@ class QwenASRService(WebsocketSTTService):
         if not is_valid_asr_input(transcript):
             logger.info(f"[QwenASR] 转录完成但输入无效，跳过后续流程: {transcript}")
             await self.stop_processing_metrics()
+            # ⭐ 广播 TranscriptionFilteredFrame，通知 StateManager 恢复到 IDLE
+            await self.push_frame(TranscriptionFilteredFrame(text=transcript, reason="filtered"))
+            logger.info(f"[QwenASR] 已广播 TranscriptionFilteredFrame: {transcript}")
             return
 
         user_id = self._user_id or ""

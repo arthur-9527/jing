@@ -7,27 +7,22 @@ OpenClaw WebSocket 服务模块（内部组件）
 - 配置管理（config.py）
 - 数据模型（models.py）
 
-⭐ 新任务系统架构：
-- TaskSystem（app/task_system/）统一管理任务
-- OpenClawProvider 使用此模块的内部组件
-- 不再导出 OpenClawTaskManager（旧系统已废弃）
+任务系统统一使用 app/task_system/：
+- TaskSystem：统一管理任务
+- OpenClawProvider：使用此模块的内部组件
 
-使用示例（新系统）:
+使用示例:
     from app.task_system import get_task_system
     
-    # 提交任务
+    task_system = get_task_system()
+    await task_system.start()
+    
     task_id = await task_system.submit(
         tool_prompt="帮我查询天气",
         provider_name="openclaw",
     )
-    
-    # 等待播报
     broadcast = await task_system.wait_for_broadcast(task_id)
 """
-
-# ⭐ 不再导出旧系统的 TaskManager
-# OpenClawTaskManager 和 get_openclaw_manager 已废弃
-# 新系统使用 app.task_system.TaskSystem
 
 # 导出配置和数据模型（供 OpenClawProvider 内部使用）
 from .config import (
@@ -49,10 +44,6 @@ from .models import (
 )
 
 __all__ = [
-    # ⭐ 已废弃：不再导出旧系统
-    # "OpenClawTaskManager",
-    # "get_openclaw_manager",
-
     # 配置（内部使用）
     "OpenClawServiceConfig",
     "OpenClawWSConfig",
@@ -72,7 +63,7 @@ __all__ = [
 
 # 版本信息
 __version__ = "1.0.0"
-__author__ = "Jing Team"
+__author__ = "MMD Agent Team"
 
 # 模块级别文档
 __doc__ += """

@@ -1,7 +1,7 @@
 """测试记忆系统数据库接口
 
 运行方式：
-    cd /home/test/raspi_mmd/jing
+    cd /home/test/raspi_mmd/agent_backend
     python tests/test_memory_models.py
 """
 

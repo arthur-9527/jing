@@ -22,7 +22,7 @@ loguru==0.7.3
 tiktoken>=0.7.0
 
 # Pipecat / Realtime pipeline
-pipecat-ai==0.0.108
+pipecat-ai==0.0.107
 cartesia>=3.0.2
 
 # Deepgram STT/TTS
@@ -30,8 +30,7 @@ deepgram-sdk>=6.0.1,<7
 websockets>=14.1
 
 # Audio/Math
-# 注意: scipy 1.12.0 需要 numpy 1.x，不能使用 numpy 2.x
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.0
 scipy==1.12.0
 sounddevice>=0.5.0
 PyAudio>=0.2.14
@@ -54,6 +53,3 @@ torch>=2.0.0  # sentence-transformers 依赖
 
 # ========== 定时任务调度 ==========
 apscheduler>=3.10.0
-
-# =======redis
-redis >=7.0.0

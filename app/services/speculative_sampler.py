@@ -176,14 +176,21 @@ class SpeculativeSampler:
                 elif isinstance(item, dict):
                     item_type = item.get("type")
                     
-                    if item_type == "action":
-                        action_name = item.get("action_name")
-                        trigger_char = item.get("trigger_char")
-                        if action_name and trigger_char:
+                    # ⭐ 处理 action_data 类型（新的统一动作处理格式）
+                    if item_type == "action_data":
+                        action_data = item.get("action_data")
+                        trigger_context = item.get("trigger_context", "")
+                        if action_data:
                             request.action_events.append({
-                                "action_name": action_name,
-                                "trigger_char": trigger_char,
+                                "action_data": action_data,
+                                "trigger_context": trigger_context,
                             })
+                        continue
+                    
+                    # 旧的 action 类型（兼容）
+                    if item_type == "action":
+                        logger.debug("[SpeculativeSampler] 收到旧的 action 事件，已忽略")
+                        continue
                     elif item_type == "emotion_delta":
                         request.emotion_delta = item.get("emotion_delta")
                     elif item_type == "tool_prompt":

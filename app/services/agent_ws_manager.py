@@ -130,15 +130,8 @@ class AgentWSManager:
             "status": self._current_status.value
         })
 
-        # ⭐ 发送模型 URL（前端根据此加载 MMD 模型）
-        character_id = self._get_character_id()
-        if character_id:
-            await self.send_to_client(client_id, {
-                "type": "model_url",
-                "model_url": f"/characters/{character_id}/model/{character_id}.pmx",
-                "model_name": character_id
-            })
-            logger.info(f"[AgentWS] 发送模型 URL: character_id={character_id}")
+        # 注意：模型 URL 不再自动发送，改为前端主动请求（get_model_url）
+        # 这样解决后端先启动、前端后启动时模型 URL 丢失的问题
 
         # 回调
         if self._on_client_connected:
@@ -296,6 +289,22 @@ class AgentWSManager:
                     "type": "pong",
                     "timestamp": time.time()
                 })
+
+            elif msg_type == "get_model_url":
+                # 前端主动请求模型 URL
+                character_id = self._get_character_id()
+                if character_id:
+                    await self.send_to_client(client_id, {
+                        "type": "model_url",
+                        "model_url": f"/characters/{character_id}/model/{character_id}.pmx",
+                        "model_name": character_id
+                    })
+                    logger.info(f"[AgentWS] 响应模型 URL 请求: character_id={character_id}")
+                else:
+                    await self.send_to_client(client_id, {
+                        "type": "error",
+                        "message": "No character configured"
+                    })
 
             else:
                 logger.warning(f"[AgentWS] 未知消息类型: {msg_type}")

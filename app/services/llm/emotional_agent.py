@@ -268,11 +268,9 @@ class EmotionalAgentLLMService(LLMService):
         first_chunk = True
         pending_actions: list[dict] = []
         final_metadata: dict = {}
-        matched_motion_by_phrase: dict = {}
         
-        # ⭐ 从投机请求获取预匹配结果
-        if speculative_request:
-            matched_motion_by_phrase = speculative_request.matched_motion_by_phrase
+        # ⭐ 收集动作数据（用于投机采样缓存）
+        action_data_list: list[dict] = []
         
         try:
             async for item in stream_source:
@@ -300,16 +298,20 @@ class EmotionalAgentLLMService(LLMService):
                             await self._set_tts_emotion(emotion_delta)
                         continue
                     
-                    # action 事件 - 收集并使用预匹配结果
-                    if item_type == "action":
-                        action_name = item.get("action_name")
-                        trigger_char = item.get("trigger_char")
-                        if action_name and trigger_char:
-                            pending_actions.append({
-                                "action_name": action_name,
-                                "trigger_char": trigger_char,
-                                "matched_motion": matched_motion_by_phrase.get(action_name),  # ⭐ 使用预匹配结果
+                    # ⭐ action_data 事件 - 新的统一动作处理格式
+                    if item_type == "action_data":
+                        action_data = item.get("action_data")
+                        trigger_context = item.get("trigger_context", "")
+                        if action_data:
+                            action_data_list.append({
+                                "action_data": action_data,
+                                "trigger_context": trigger_context,
                             })
+                        continue
+                    
+                    # 旧的 action 事件（兼容）
+                    if item_type == "action":
+                        logger.debug("[EmotionalAgentLLM] 收到旧的 action 事件，已忽略")
                         continue
                     
                     # tool_prompt - 不推送到TTS
@@ -319,23 +321,23 @@ class EmotionalAgentLLMService(LLMService):
                     # 最终 metadata（包含 turn_context、first_pass 等）
                     if item_type == "meta" or "turn_context" in item:
                         final_metadata = item
-                        # ⭐ 更新预匹配结果（可能从 meta 中获取）
-                        if item.get("matched_motion_by_phrase"):
-                            matched_motion_by_phrase = item.get("matched_motion_by_phrase", {})
                         continue
             
-            # ⭐ 流结束后，处理 pending_actions
-            # 过滤有效动作（有预匹配结果）
-            pending_actions = [a for a in pending_actions if a.get("matched_motion")]
-            
-            if pending_actions:
+            # ⭐ 流结束后，处理 action_data_list
+            # 调用动作处理模块
+            if action_data_list:
                 try:
-                    from app.services.agent_service import get_agent_service
-                    agent_service = get_agent_service()
-                    await agent_service.queue_action_structs(pending_actions)
-                    logger.info(f"[Motion] 成功入队 {len(pending_actions)} 个动作")
+                    from app.agent.action.processor import process_action
+                    for action_item in action_data_list:
+                        # following_text 使用 trigger_context 作为参考
+                        following_text = action_item.get("trigger_context", "")
+                        await process_action(
+                            action_data=action_item["action_data"],
+                            following_text=following_text,
+                        )
+                    logger.info(f"[Motion] 成功处理 {len(action_data_list)} 个动作数据")
                 except Exception as e:
-                    logger.error(f"[Motion] 动作结构体入队失败: {e}")
+                    logger.error(f"[Motion] 动作处理失败: {e}")
             
             # ⭐ 执行后续处理（投机请求专用）
             if is_speculative and speculative_request:
@@ -424,7 +426,16 @@ class EmotionalAgentLLMService(LLMService):
                 raise
             except Exception as e:
                 logger.error(f"[EmotionalAgentLLM] 处理异常: {e}")
-                await self.push_error(error_msg=str(e), exception=e)
+                # ⭐ 降级处理：推送固定回复文本，让流程正常完成
+                fallback_text = "抱歉，我刚才走神了，你能再说一遍吗？"
+                await self._push_llm_text(fallback_text)
+                logger.info(f"[EmotionalAgentLLM] 已推送降级回复: {fallback_text}")
+                # 写入 Redis
+                if self._buffer:
+                    try:
+                        await self._buffer.append_assistant_message(fallback_text)
+                    except Exception as buf_err:
+                        logger.warning(f"[EmotionalAgentLLM] 降级回复写入 Redis 失败: {buf_err}")
             finally:
                 await self.stop_processing_metrics()
                 await self.push_frame(LLMFullResponseEndFrame())

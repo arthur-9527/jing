@@ -261,16 +261,15 @@ class PostProcessor:
         """
         response_text = response_text.strip()
         
-        # 解析 <a> 动作标签
-        action_json = None
+        # ⭐ 解析 <a> 动作标签 - 存储原始字符串
+        action_data = None
         action_match = re.search(r'<a>(.*?)</a>', response_text, re.DOTALL)
         if action_match:
-            action_content = action_match.group(1).strip()
-            action_json = self._parse_action_json(action_content)
-            if action_json:
+            # 存储原始 <a>...</a> 字符串
+            action_data = action_match.group(0).strip()
+            if action_data:
                 logger.info(
-                    f"[PostProcessor] 解析到动作标签: "
-                    f"action={action_json.get('action')}, emotion={action_json.get('emotion')}"
+                    f"[PostProcessor] 提取动作数据: {action_data[:50]}..."
                 )
             # 移除 <a> 标签
             response_text = re.sub(r'<a>.*?</a>', '', response_text, flags=re.DOTALL).strip()
@@ -304,7 +303,7 @@ class PostProcessor:
             task_id=task_id,
             content=final_content,
             panel_html=final_panel_html,
-            action=action_json,
+            action=action_data,  # ⭐ 存储原始 <a>...</a> 字符串
         )
     
     def _merge_panel_html(

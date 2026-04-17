@@ -208,7 +208,7 @@ class BroadcastContent:
     task_id: str
     content: str
     panel_html: Optional[Dict[str, Any]] = None
-    action: Optional[Dict[str, Any]] = None
+    action: Optional[str] = None  # ⭐ 原始 <a>...</a> 字符串
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（用于播报队列）"""

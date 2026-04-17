@@ -27,8 +27,9 @@ htmlcov/
 *.log
 
 # Build / Distribution
+dist/
 build/
 *.egg-info/
 
-# Models (embedding models are large, download separately)
-models/
+# Documentation
+docs/

@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 
 # 添加项目路径
-sys.path.insert(0, "/home/test/raspi_mmd/jing")
+sys.path.insert(0, "/home/test/raspi_mmd/agent_backend")
 
 from app.scheduler import get_scheduler, JobTriggerType
 

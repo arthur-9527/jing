@@ -301,12 +301,13 @@ class PanelManager:
     
     async def _calculate_panel_depth(self, panel_html: dict) -> None:
         """
-        计算面板深度 z（方案C：新窗口 z=0，老窗口后退 z+2）
+        计算面板深度 z
         
-        深度规则：
-        - 新窗口 z = 0（最大/最前）
-        - 老窗口后退 z + 2（变小/后退）
-        - 最大后退到 z = 6（scale = 0.7）
+        新坐标系深度规则：
+        - z 范围：0.5 ~ 2（越大越靠前）
+        - 新窗口 z = 2（最靠前）
+        - 老窗口后退 z - 0.3（变小/后退）
+        - 最小深度限制 z = 0.5（避免超出镜头范围）
         
         Args:
             panel_html: Panel 内容字典，会直接修改其 z 字段
@@ -314,12 +315,12 @@ class PanelManager:
         if self._panels:
             # 有旧窗口，让旧窗口后退
             for old_panel_id, old_panel in self._panels.items():
-                old_z = old_panel.get("z", 0)
-                new_z = old_z + 2
+                old_z = old_panel.get("z", 2.0)
+                new_z = old_z - 0.3
                 
-                # 限制最大深度 z = 6
-                if new_z > 6:
-                    new_z = 6
+                # 限制最小深度 z = 0.5
+                if new_z < 0.5:
+                    new_z = 0.5
                 
                 # 更新老窗口的 z 值
                 old_panel["z"] = new_z
@@ -336,59 +337,37 @@ class PanelManager:
                     f"z={old_z} → {new_z}"
                 )
             
-            # 新窗口 z = 0
-            panel_html["z"] = 0
-            logger.info("[PanelManager] 新窗口深度: z=0")
+            # 新窗口 z = 2（最靠前）
+            panel_html["z"] = 2.0
+            logger.info("[PanelManager] 新窗口深度: z=2.0（最靠前）")
         else:
-            # 无旧窗口，z = 0
-            panel_html["z"] = 0
-            logger.info("[PanelManager] 首个窗口深度: z=0")
+            # 无旧窗口，z = 2（最靠前）
+            panel_html["z"] = 2.0
+            logger.info("[PanelManager] 首个窗口深度: z=2.0（最靠前）")
     
     # ===== 位置计算 =====
     
     def _calculate_panel_position(self, panel_html: dict) -> None:
         """
-        根据面板大小自动计算位置 x, y
+        设置面板位置 x, y
         
-        位置规则：
-        - 大面板（宽 > 400 或高 > 300）→ 左中位置
-        - 中/小面板 → 居中位置
+        新坐标系规则：
+        - 所有面板统一放置在屏幕中心点 (0, 0)
+        - x = 0 表示水平中心
+        - y = 0 表示垂直中心
+        - 不再根据面板大小计算不同位置
         
         Args:
             panel_html: Panel 内容字典，会直接修改其 x, y 字段
         """
-        from app.config import settings
+        # 所有面板统一设置为中心点 (0, 0)
+        panel_html["x"] = 0
+        panel_html["y"] = 0
         
-        # 获取屏幕尺寸
-        screen_width = settings.SCREEN_WIDTH  # 默认 1920
-        screen_height = settings.SCREEN_HEIGHT  # 默认 1080
-        
-        # 获取面板尺寸（如果没有则使用默认值）
-        panel_width = panel_html.get("width", 300)
-        panel_height = panel_html.get("height", 260)
-        
-        # 边缘间距
-        margin = 100
-        
-        # 根据面板大小选择位置
-        if panel_width > 400 or panel_height > 300:
-            # 大面板 → 左中位置
-            panel_html["x"] = margin
-            panel_html["y"] = screen_height // 2 - panel_height // 2
-            logger.debug(
-                f"[PanelManager] 大面板位置：左中, "
-                f"panel_size={panel_width}x{panel_height}, "
-                f"position=(x={panel_html['x']}, y={panel_html['y']})"
-            )
-        else:
-            # 中/小面板 → 居中位置
-            panel_html["x"] = screen_width // 2 - panel_width // 2
-            panel_html["y"] = screen_height // 2 - panel_height // 2
-            logger.debug(
-                f"[PanelManager] 小面板位置：居中, "
-                f"panel_size={panel_width}x{panel_height}, "
-                f"position=(x={panel_html['x']}, y={panel_html['y']})"
-            )
+        logger.debug(
+            f"[PanelManager] 面板位置：中心点, "
+            f"position=(x=0, y=0)"
+        )
     
     # ===== 状态查询 =====
     

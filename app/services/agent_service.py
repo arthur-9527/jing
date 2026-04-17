@@ -83,6 +83,12 @@ class AgentService:
         
         # ⭐ 播报调度器（Redis 队列 + 1s 定时轮询）
         self._playback_scheduler: Optional["PlaybackScheduler"] = None
+        
+        # ⭐ APScheduler 空闲检测任务 ID
+        self._idle_scheduler_job_id: Optional[str] = None
+        
+        # ⭐ APScheduler 播报检测任务 ID
+        self._playback_scheduler_job_id: Optional[str] = None
 
     @property
     def is_initialized(self) -> bool:
@@ -519,7 +525,6 @@ class AgentService:
                 ws_manager=self.ws_manager,
                 frame_queue=self._frame_queue,
                 max_history=100,
-                state_timeout=60.0,
             )
             logger.info("[AgentService] 状态管理处理器已创建")
             
@@ -662,6 +667,13 @@ class AgentService:
         gate = get_init_gate()
         await gate.wait_all(timeout=30.0)
 
+        # ⭐ 注册状态变化回调（监听 INITING→IDLE 转换，启动空闲调度）
+        if self._state_manager:
+            self._state_manager.register_state_change_callback(
+                self._on_state_change
+            )
+            logger.info("[AgentService] 状态变化回调已注册")
+
         # ⭐ 所有组件就绪后才切换到 IDLE
         if self._state_manager:
             await self._state_manager.force_transition(
@@ -672,6 +684,8 @@ class AgentService:
         else:
             # 如果 StateManager 未创建，直接广播状态
             await self.ws_manager.broadcast_status(AgentStatus.IDLE)
+            # ⭐ 无 StateManager 时直接启动空闲调度
+            await self._start_idle_scheduling()
 
         self._running = True
         logger.info("[AgentService] 启动完成")
@@ -724,6 +738,12 @@ class AgentService:
             return
 
         logger.info("[AgentService] 停止...")
+
+        # ⭐ 停止空闲调度 APScheduler 任务
+        await self._stop_idle_scheduling()
+
+        # ⭐ 停止播报调度 APScheduler 任务
+        await self._stop_playback_scheduling()
 
         # ⭐ 停止播报调度器
         if self._playback_scheduler:
@@ -1088,6 +1108,144 @@ class AgentService:
     async def set_status(self, status: AgentStatus):
         """设置并广播状态"""
         await self.ws_manager.broadcast_status(status)
+
+    async def _on_state_change(self, old_state: AgentState, new_state: AgentState):
+        """状态变化回调
+        
+        ⭐ 监听 INITING → IDLE 转换，启动空闲调度和播报调度 APScheduler 任务
+        """
+        # ⭐ 只有 INITING → IDLE 转换才启动调度任务
+        if old_state == AgentState.INITING and new_state == AgentState.IDLE:
+            logger.info("[AgentService] 检测到 INITING → IDLE 转换，启动调度任务")
+            await self._start_idle_scheduling()
+            await self._start_playback_scheduling()
+
+    async def _start_idle_scheduling(self):
+        """启动空闲调度 APScheduler 任务
+        
+        ⭐ 使用 APScheduler 的 interval 触发器，定时调用 IdleScheduler.on_idle_trigger()
+        - 初始延迟 20 秒（IDLE_DETECT_DELAY）
+        - 之后每 10 秒检查一次（使用固定间隔，在回调中判断是否执行）
+        """
+        if not self._idle_scheduler:
+            logger.warning("[AgentService] IdleScheduler 未初始化，跳过空闲调度")
+            return
+
+        if self._idle_scheduler_job_id:
+            logger.warning("[AgentService] 空闲调度任务已存在，跳过")
+            return
+
+        from app.scheduler.scheduler import get_scheduler
+        from app.services.frame_queue.idle_scheduler import IDLE_DETECT_DELAY
+
+        scheduler = get_scheduler()
+        
+        # ⭐ 确保调度器已启动
+        if not scheduler.is_running:
+            await scheduler.start()
+            logger.info("[AgentService] APScheduler 已启动")
+
+        # ⭐ 注册空闲检测任务（每 10 秒检查一次）
+        job_id = "idle_scheduler_trigger"
+        
+        async def _idle_trigger_wrapper():
+            """APScheduler 任务包装器
+            
+            调用 IdleScheduler.on_idle_trigger()，并根据返回值动态调整下次执行时间
+            """
+            if not self._idle_scheduler:
+                return
+            
+            next_interval = await self._idle_scheduler.on_idle_trigger()
+            
+            # ⭐ 如果返回了下次间隔，动态修改任务的下次执行时间
+            if next_interval is not None and scheduler.get_job(job_id):
+                from datetime import datetime, timedelta
+                next_run = datetime.now() + timedelta(seconds=next_interval)
+                scheduler.scheduler.modify_job(job_id, next_run_time=next_run)
+                logger.debug(f"[AgentService] 空闲检测下次执行: {next_run.strftime('%H:%M:%S')}")
+
+        scheduler.add_interval_job(
+            func=_idle_trigger_wrapper,
+            job_id=job_id,
+            name="空闲检测触发器",
+            interval_config={"seconds": 10},  # 每 10 秒检查一次
+            description="定时检查空闲状态并插入 idle 动作",
+            enabled=True,
+            replace_existing=True,
+        )
+
+        self._idle_scheduler_job_id = job_id
+        self._idle_scheduler.set_idle_job_id(job_id)
+        
+        logger.info(f"[AgentService] 空闲调度 APScheduler 任务已注册: {job_id}")
+
+    async def _stop_idle_scheduling(self):
+        """停止空闲调度 APScheduler 任务"""
+        if not self._idle_scheduler_job_id:
+            return
+
+        from app.scheduler.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        
+        scheduler.remove_job(self._idle_scheduler_job_id)
+        self._idle_scheduler_job_id = None
+        
+        logger.info(f"[AgentService] 空闲调度 APScheduler 任务已移除")
+
+    async def _start_playback_scheduling(self):
+        """启动播报调度 APScheduler 任务
+        
+        ⭐ 使用 APScheduler 的 interval 触发器，定时调用 PlaybackScheduler.on_check_trigger()
+        - 每秒检查一次队列状态
+        """
+        if not self._playback_scheduler:
+            logger.warning("[AgentService] PlaybackScheduler 未初始化，跳过播报调度")
+            return
+
+        if self._playback_scheduler_job_id:
+            logger.warning("[AgentService] 播报调度任务已存在，跳过")
+            return
+
+        from app.scheduler.scheduler import get_scheduler
+
+        scheduler = get_scheduler()
+        
+        # ⭐ 确保调度器已启动
+        if not scheduler.is_running:
+            await scheduler.start()
+            logger.info("[AgentService] APScheduler 已启动")
+
+        # ⭐ 注册播报检测任务（每 1 秒检查一次）
+        job_id = "playback_scheduler_check"
+
+        scheduler.add_interval_job(
+            func=self._playback_scheduler.on_check_trigger,
+            job_id=job_id,
+            name="播报队列检查器",
+            interval_config={"seconds": 1},  # 每秒检查一次
+            description="定时检查播报队列并执行播报任务",
+            enabled=True,
+            replace_existing=True,
+        )
+
+        self._playback_scheduler_job_id = job_id
+        self._playback_scheduler.set_job_id(job_id)
+        
+        logger.info(f"[AgentService] 播报调度 APScheduler 任务已注册: {job_id}")
+
+    async def _stop_playback_scheduling(self):
+        """停止播报调度 APScheduler 任务"""
+        if not self._playback_scheduler_job_id:
+            return
+
+        from app.scheduler.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        
+        scheduler.remove_job(self._playback_scheduler_job_id)
+        self._playback_scheduler_job_id = None
+        
+        logger.info(f"[AgentService] 播报调度 APScheduler 任务已移除")
 
     # ===== LLM 响应处理 =====
 

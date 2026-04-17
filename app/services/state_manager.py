@@ -33,6 +33,9 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 
+# ⭐ 导入自定义帧：无效转录事件
+from app.services.stt.qwen_asr import TranscriptionFilteredFrame
+
 if TYPE_CHECKING:
     from app.services.agent_ws_manager import AgentWSManager
     from app.services.frame_queue.frame_queue import FrameQueueManager
@@ -75,7 +78,6 @@ class StateManagerProcessor(FrameProcessor):
         ws_manager: "AgentWSManager",
         frame_queue: Optional["FrameQueueManager"] = None,
         max_history: int = 100,
-        state_timeout: float = 60.0,
         **kwargs,
     ):
         """
@@ -83,7 +85,6 @@ class StateManagerProcessor(FrameProcessor):
             ws_manager: WebSocket 管理器，用于广播状态
             frame_queue: 帧队列管理器，用于检测口型帧耗尽
             max_history: 状态历史最大记录数
-            state_timeout: 非IDLE状态超时时间，超时后自动重置
             **kwargs: FrameProcessor 其他参数
         """
         super().__init__(**kwargs)
@@ -98,9 +99,8 @@ class StateManagerProcessor(FrameProcessor):
         # 状态历史
         self._state_history: deque[StateTransitionEvent] = deque(maxlen=max_history)
         
-        # 状态进入时间（用于超时检测）
+        # 状态进入时间（用于统计）
         self._state_enter_time: float = time.monotonic()
-        self._state_timeout = state_timeout
         
         # TTS 计数器（处理分段 TTS）
         self._tts_start_count: int = 0
@@ -112,9 +112,6 @@ class StateManagerProcessor(FrameProcessor):
         
         # 状态变化回调列表
         self._on_state_change_callbacks: list[Callable[[AgentState, AgentState], Awaitable[None]]] = []
-        
-        # 超时检测任务
-        self._timeout_check_task: Optional[asyncio.Task] = None
         
         logger.info(f"[StateManager] 初始化，当前状态: {self._current_state.value}")
     
@@ -247,6 +244,27 @@ class StateManagerProcessor(FrameProcessor):
                 self._waiting_for_lip_empty = False
                 logger.info("[StateManager] 收到打断信号，切换到 LISTENING")
             
+            # ⭐ 无效转录 → IDLE（从 THINKING 恢复）
+            elif isinstance(frame, TranscriptionFilteredFrame):
+                if self._current_state == AgentState.THINKING:
+                    logger.info(
+                        f"[StateManager] 收到无效转录帧，THINKING → IDLE "
+                        f"(text: {frame.text}, reason: {frame.reason})"
+                    )
+                    await self._transition_to(
+                        AgentState.IDLE,
+                        reason="transcription_filtered",
+                        frame_type=frame_type,
+                    )
+                    # 重置计数器
+                    self._tts_start_count = 0
+                    self._tts_stop_count = 0
+                    self._waiting_for_lip_empty = False
+                else:
+                    logger.debug(
+                        f"[StateManager] 收到无效转录帧，当前状态: {self._current_state.value}，不转换"
+                    )
+            
             # 传递 Frame 到下一个处理器
             await self.push_frame(frame, direction)
             
@@ -376,7 +394,8 @@ class StateManagerProcessor(FrameProcessor):
         valid_transitions = {
             AgentState.IDLE: [AgentState.LISTENING, AgentState.SPEAKING],
             AgentState.LISTENING: [AgentState.THINKING, AgentState.LISTENING],
-            AgentState.THINKING: [AgentState.SPEAKING, AgentState.LISTENING],
+            # ⭐ THINKING 可以转换到 IDLE（无效转录恢复）
+            AgentState.THINKING: [AgentState.SPEAKING, AgentState.LISTENING, AgentState.IDLE],
             AgentState.SPEAKING: [AgentState.IDLE, AgentState.LISTENING],
         }
         
@@ -468,44 +487,12 @@ class StateManagerProcessor(FrameProcessor):
     async def start(self, frame: StartFrame):
         """启动处理器"""
         await super().start(frame)
-        # 启动超时检测任务
-        self._timeout_check_task = asyncio.create_task(self._timeout_check_loop())
         logger.info("[StateManager] 处理器已启动")
     
     async def stop(self, frame: EndFrame):
         """停止处理器"""
-        # 取消超时检测任务
-        if self._timeout_check_task:
-            self._timeout_check_task.cancel()
-            try:
-                await self._timeout_check_task
-            except asyncio.CancelledError:
-                pass
-            self._timeout_check_task = None
-        
         await super().stop(frame)
         logger.info("[StateManager] 处理器已停止")
-    
-    async def _timeout_check_loop(self):
-        """状态超时检测循环"""
-        while True:
-            try:
-                await asyncio.sleep(10.0)  # 每10秒检查一次
-                
-                # 检查是否超时
-                if self._current_state != AgentState.IDLE:
-                    duration = self.state_duration
-                    if duration > self._state_timeout:
-                        logger.warning(
-                            f"[StateManager] 状态超时: {self._current_state.value} "
-                            f"持续 {duration:.1f}s，强制重置到 IDLE"
-                        )
-                        await self.force_to_idle()
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[StateManager] 超时检测异常: {e}")
     
     # ===== 查询接口 =====
     

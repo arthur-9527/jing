@@ -1,4 +1,4 @@
-"""Jing - 主应用入口"""
+"""MMD Agent Backend - 主应用入口"""
 
 import logging
 import os
@@ -149,8 +149,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Jing",
-    description="Jing - AI Agent 后端",
+    title="MMD Agent Backend",
+    description="MMD 虚拟人动作管理 + 情绪 AI Agent 后端",
     version="1.0.0",
     lifespan=lifespan,
 )

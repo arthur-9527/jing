@@ -49,86 +49,8 @@ def _get_cache_heartbeat():
 
 logger = logging.getLogger(__name__)
 
-# 容错正则模式：兼容 <a>、:a>、a> 等变体
-_ACTION_TAG_PATTERN = re.compile(r"[:<]?a>?(.*?)</a>", re.DOTALL)
-
-
-def _parse_action_json(text: str) -> dict | None:
-    """
-    解析动作标签内的 JSON，参考 meta 标签解析逻辑。
-    
-    支持多种解析策略：
-    1. 直接 json.loads
-    2. raw_decode 只解析第一个 JSON
-    3. 正则提取 JSON 块
-    4. 尝试修复被截断的 JSON（缺少结尾的 }>）
-    """
-    text = text.strip()
-    if not text:
-        return None
-    
-    # 策略1：直接解析
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    
-    # 策略2：raw_decode
-    try:
-        decoder = json.JSONDecoder()
-        result, _ = decoder.raw_decode(text)
-        if isinstance(result, dict):
-            return result
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    # 策略3：正则提取 JSON 块（处理嵌套情况）
-    # 匹配最外层的 { ... }
-    try:
-        # 处理标准 JSON 格式
-        match = re.search(r'\{(?:[^{}]|\{[^{}]*\})*\}', text)
-        if match:
-            json_str = match.group()
-            return json.loads(json_str)
-    except json.JSONDecodeError:
-        pass
-    
-    # 策略4：尝试修复被截断的 JSON
-    # 常见情况：JSON 被截断在 "}>我" 这种模式
-    try:
-        # 找到最后一个完整的字段
-        truncated_match = re.search(r'(\{"[^"]*":\s*"[^"]*"[^}]*)$', text)
-        if truncated_match:
-            # 尝试补全
-            partial = truncated_match.group(1)
-            # 尝试解析（虽然可能不完整，但至少能获取 action）
-            result = json.loads(partial + '"}')
-            return result
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    # 策略5：尝试提取 action 字段（即使 JSON 不完整）
-    try:
-        action_match = re.search(r'"action"\s*:\s*"([^"]+)"', text)
-        if action_match:
-            result = {"action": action_match.group(1)}
-            # 尝试提取 emotion
-            emotion_match = re.search(r'"emotion"\s*:\s*"([^"]+)"', text)
-            if emotion_match:
-                result["emotion"] = emotion_match.group(1)
-            else:
-                result["emotion"] = ""
-            # 尝试提取 desp
-            desp_match = re.search(r'"desp"\s*:\s*"([^"]+)"', text)
-            if desp_match:
-                result["desp"] = desp_match.group(1)
-            else:
-                result["desp"] = ""
-            return result
-    except Exception:
-        pass
-    
-    return None
+# ⭐ 动作处理已迁移到 app/agent/action/processor.py
+# 以下冗余代码已删除：_ACTION_TAG_PATTERN, _parse_action_json
 
 
 class EmotionalAgent:
@@ -412,16 +334,21 @@ class EmotionalAgent:
                         yield item
                         continue
                     
-                    # 处理 action 类型（收集 + yield）
-                    if item_type == "action":
-                        action_name = item.get("action_name")
-                        if action_name:
+                    # ⭐ 处理 action_data 类型（新的统一动作处理格式）
+                    if item_type == "action_data":
+                        action_data = item.get("action_data")
+                        trigger_context = item.get("trigger_context", "")
+                        if action_data:
                             action_events.append({
-                                "action_name": action_name,
-                                "trigger_char": item.get("trigger_char"),
+                                "action_data": action_data,
+                                "trigger_context": trigger_context,
                             })
-                        # ⭐ yield action 事件到下游
-                        yield item
+                        # 不 yield 到下游，确认后统一处理
+                        continue
+                    
+                    # 旧的 action 类型（兼容）
+                    if item_type == "action":
+                        logger.debug("[EmotionalAgent] 投机模式收到旧的 action 事件，已忽略")
                         continue
                     
                     # meta 类型（最终的情绪元数据，内部收集）
@@ -459,22 +386,24 @@ class EmotionalAgent:
             metadata["used_tool"] = False
             metadata["followup_scheduled"] = False
             
-            # ⭐ 预先执行动作匹配（耗时操作，消除确认后延迟）
-            matched_motion_by_phrase = await self._match_actions(
-                expression=expression,
-                action_events=action_events,
-            )
-            logger.info(
-                "[EmotionalAgent] 投机采样预先动作匹配完成，匹配数: %d",
-                len(matched_motion_by_phrase)
-            )
+            # ⭐ 预先执行动作处理（使用新的统一模块）
+            if action_events:
+                from app.agent.action.processor import process_actions_batch
+                await process_actions_batch(
+                    action_events=action_events,  # ⭐ 传完整结构，包含 trigger_context
+                    expression=expression,
+                )
+                logger.info(
+                    "[EmotionalAgent] 投机采样动作处理完成，处理数: %d",
+                    len(action_events)
+                )
             
             # 构建完整 first_pass 结果
             first_pass = {
                 "metadata": metadata,
                 "expression": expression,
                 "action_events": action_events,
-                "stream_items": expression_chunks + [{"type": "action", "action_name": e["action_name"], "trigger_char": e["trigger_char"]} for e in action_events],
+                "stream_items": expression_chunks,
             }
             
             # ⭐ 投机模式：保存所有预处理结果，确认后快速应用
@@ -483,7 +412,7 @@ class EmotionalAgent:
             # 保存上下文和预处理结果
             metadata["turn_context"] = turn_context
             metadata["first_pass"] = first_pass
-            metadata["matched_motion_by_phrase"] = matched_motion_by_phrase
+            metadata["matched_motion_by_phrase"] = {}  # 动作已在 process_actions_batch 中处理
             metadata["expression"] = expression
             
             try:
@@ -645,14 +574,21 @@ class EmotionalAgent:
                     logger.info("[EmotionalAgent] 收到 tool_prompt: %s", tool_prompt)
                     continue
                     
-                if item_type == "action":
-                    action_name = item.get("action_name")
-                    if action_name:
+                # ⭐ 处理 action_data 类型（新的统一动作处理格式）
+                if item_type == "action_data":
+                    action_data = item.get("action_data")
+                    trigger_context = item.get("trigger_context", "")
+                    if action_data:
                         action_events.append({
-                            "action_name": action_name,
-                            "trigger_char": item.get("trigger_char"),
+                            "action_data": action_data,
+                            "trigger_context": trigger_context,
                         })
-                    visible_stream_items.append(item)
+                    # 不添加到 visible_stream_items，内部收集
+                    continue
+                
+                # 旧的 action 类型（兼容）
+                if item_type == "action":
+                    logger.debug("[EmotionalAgent] _generate_first_pass 收到旧的 action 事件，已忽略")
                     continue
 
                 # meta 类型（最终的情绪元数据）
@@ -695,7 +631,7 @@ class EmotionalAgent:
             str: 台词文本片段（直接推送到 TTS）
             dict: 各种事件
                 - {"type": "emotion_delta", "emotion_delta": {...}}: 情绪增量（设置 TTS 情绪）
-                - {"type": "action", "action_name": str, "trigger_char": str}: 动作事件
+                - {"type": "action_data", "action_data": str, "trigger_context": str}: 动作数据
                 - {"type": "_internal_result", ...}: 内部收集结果（用于后续处理，不推送到 TTS）
         """
         metadata = None
@@ -725,16 +661,21 @@ class EmotionalAgent:
                     yield item
                     continue
                 
-                # 处理 action 类型
-                if item_type == "action":
-                    action_name = item.get("action_name")
-                    if action_name:
+                # ⭐ 处理 action_data 类型（新的统一动作处理格式）
+                if item_type == "action_data":
+                    action_data = item.get("action_data")
+                    trigger_context = item.get("trigger_context", "")
+                    if action_data:
                         action_events.append({
-                            "action_name": action_name,
-                            "trigger_char": item.get("trigger_char"),
+                            "action_data": action_data,
+                            "trigger_context": trigger_context,
                         })
-                    # ⭐ yield action 事件到下游
-                    yield item
+                    # 不 yield 到下游，由 _process_stream 统一处理
+                    continue
+                
+                # 旧的 action 类型（兼容）
+                if item_type == "action":
+                    logger.debug("[EmotionalAgent] 收到旧的 action 事件，已忽略")
                     continue
                 
                 # meta 类型（最终的情绪元数据）
@@ -964,19 +905,26 @@ class EmotionalAgent:
         metadata = final_result["metadata"]
         expression = final_result["expression"]
 
-        # ⭐ 如果有预先匹配的结果，直接使用（投机采样确认后快速处理）
-        if use_precomputed_match and metadata.get("matched_motion_by_phrase"):
-            matched_motion_by_phrase = metadata["matched_motion_by_phrase"]
+        # ⭐ 动作处理已在流式处理时由 emotional_agent.py 完成
+        # 如果有预先匹配的结果，直接使用
+        matched_motion_by_phrase = metadata.get("matched_motion_by_phrase", {})
+        if use_precomputed_match and matched_motion_by_phrase:
             logger.info(
                 "[EmotionalAgent] 使用预先匹配的动作结果，匹配数: %d",
                 len(matched_motion_by_phrase)
             )
-        else:
-            # 正常流程：执行动作匹配
-            action_events = final_result.get("action_events") or self._build_action_events_from_expression(expression)
-            matched_motion_by_phrase = await self._match_actions(
+        
+        # ⭐ 如果 action_events 存在（新格式），调用统一处理模块
+        action_events = final_result.get("action_events", [])
+        if action_events and not matched_motion_by_phrase:
+            from app.agent.action.processor import process_actions_batch
+            await process_actions_batch(
+                action_events=action_events,  # ⭐ 传完整结构，包含 trigger_context
                 expression=expression,
-                action_events=action_events,
+            )
+            logger.info(
+                "[EmotionalAgent] _finalize_turn 动作处理完成，处理数: %d",
+                len(action_events)
             )
         
         metadata["matched_motion_by_phrase"] = matched_motion_by_phrase
@@ -1016,134 +964,10 @@ class EmotionalAgent:
         if stream_mode:
             metadata["type"] = "meta"
 
-    async def _match_actions(
-        self,
-        expression: str,
-        action_events: list[dict[str, str | None]],
-    ) -> dict[str, dict]:
-        """
-        根据 A 标签中的 action/emotion/desp 执行动作匹配。
-        
-        新流程：
-        1. 使用增强的 JSON 解析（支持被截断的标签）
-        2. 使用 TagCatalogService.match_motion_by_tags() 进行匹配
-        3. 异步执行匹配
-        """
-        matched_motion_by_phrase: dict[str, dict] = {}
-        if not action_events:
-            return matched_motion_by_phrase
-
-        # 获取 TagCatalogService
-        tag_catalog = get_tag_catalog_service()
-
-        # 为每个动作事件异步执行匹配
-        match_tasks = []
-        for event in action_events:
-            # 使用增强的 JSON 解析（参考 meta 标签解析逻辑）
-            content = event.get("action_name", "")
-            action = ""
-            emotion = ""
-            desp = ""
-            
-            # 尝试用增强解析
-            action_json = _parse_action_json(content)
-            if action_json:
-                action = action_json.get("action", "").strip() if action_json.get("action") else ""
-                emotion = action_json.get("emotion", "").strip() if action_json.get("emotion") else ""
-                desp = action_json.get("desp", "").strip() if action_json.get("desp") else ""
-            
-            # 如果增强解析失败，尝试直接解析（兼容旧格式）
-            if not action_json:
-                try:
-                    action_json = json.loads(content)
-                    action = action_json.get("action", "").strip() if action_json.get("action") else ""
-                    emotion = action_json.get("emotion", "").strip() if action_json.get("emotion") else ""
-                    desp = action_json.get("desp", "").strip() if action_json.get("desp") else ""
-                except (json.JSONDecodeError, TypeError):
-                    # 兼容旧格式：直接使用 action_name 作为 action
-                    action = content.strip()
-                    desp = content.strip()
-                    if not action:
-                        continue
-
-            # action 和 emotion 至少有一个
-            if not action and not emotion:
-                continue
-            
-            # 打印解析出的动作描述
-            logger.info(f"[动作解析] action={action}, emotion={emotion}, desp={desp}")
-            
-            # 验证标签（emotion 验证失败不清空，只是不加分）
-            if action and not tag_catalog.validate_action(action):
-                logger.warning(f"[Action] 无效的 action 标签: {content}，跳过")
-                continue
-            
-            if emotion and not tag_catalog.validate_emotion(emotion):
-                logger.warning(f"[Action] emotion 标签无效，清空: {emotion}")
-                emotion = ""
-
-            # 创建匹配任务
-            task = asyncio.create_task(
-                self._match_single_action(tag_catalog, action, emotion, desp)
-            )
-            match_tasks.append((event, task))
-
-        # 等待所有匹配任务完成
-        for event, task in match_tasks:
-            matched = await task
-            if matched:
-                phrase = event.get("action_name", "")
-                matched_motion_by_phrase[phrase] = matched
-
-        return matched_motion_by_phrase
-
-    async def _match_single_action(
-        self,
-        tag_catalog,
-        action: str,
-        emotion: str,
-        desp: str,
-    ) -> dict | None:
-        """
-        单个动作的匹配。
-        
-        使用 TagCatalogService 进行匹配：
-        1. 用 action/emotion 标签筛选候选动作（最多5个）
-        2. 用 desp 描述计算 embedding 并匹配
-        3. 返回分数最高的动作（分数 > 0.5）
-        """
-        try:
-            matched = await tag_catalog.match_motion_by_tags(
-                action=action,
-                emotion=emotion,
-                desp=desp,
-            )
-            if matched:
-                logger.info(
-                    f"[Action] 动作匹配成功: {matched['display_name']} "
-                    f"(score={matched['score']:.3f}, action={action}, emotion={emotion})"
-                )
-            else:
-                logger.debug(f"[Action] 无匹配动作: action={action}, emotion={emotion}")
-            return matched
-        except Exception as e:
-            logger.exception(f"[Action] 动作匹配异常: action={action}, emotion={emotion}")
-            return None
-
-    def _build_action_events_from_expression(self, expression: str) -> list[dict[str, str | None]]:
-        """从最终文本中提取动作事件。"""
-        events: list[dict[str, str | None]] = []
-        for match in _ACTION_TAG_PATTERN.finditer(expression):
-            action_name = match.group(1).strip()
-            if not action_name:
-                continue
-            remainder = expression[match.end():]
-            trigger_char = next((ch for ch in remainder if not ch.isspace()), None)
-            events.append({
-                "action_name": action_name,
-                "trigger_char": trigger_char,
-            })
-        return events
+    # ⭐ 以下方法已迁移到 app/agent/action/processor.py:
+    # - _match_actions
+    # - _match_single_action  
+    # - _build_action_events_from_expression
 
     async def _write_memories(
         self,

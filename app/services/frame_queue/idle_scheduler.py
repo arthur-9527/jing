@@ -3,13 +3,17 @@
 
 三种动作加载场景：
 1. 低水位填充 → 只加载 default 动作（mei_wait）循环
-2. 空闲调度 → 20s 无输入后启动，每 30-60s 随机插入一个 idle 动作
+2. 空闲调度 → 20s 无输入后启动，每 30-60s 随机插入一个 idle 动作（由 APScheduler 驱动）
 3. LLM/API 触发 → 由外部直接调用 load_motion（不在此模块）
 
 注意：idle 动作插入只在系统处于 IDLE 状态时才会执行
+
+⭐ 迁移到 APScheduler：
+- 空闲检测循环由 AgentService 通过 APScheduler 任务驱动
+- IdleScheduler 提供被动回调接口：on_idle_trigger()
+- 只有在 INITING → IDLE 转换后才启动 APScheduler 任务
 """
 
-import asyncio
 import random
 import time
 from typing import Optional, Callable, TYPE_CHECKING
@@ -57,7 +61,13 @@ def keyframe_to_vpd(kf: Keyframe) -> VPDFrame:
 
 
 class IdleScheduler:
-    """待机动作调度器"""
+    """待机动作调度器
+    
+    ⭐ APScheduler 驱动模式：
+    - 空闲检测由外部 APScheduler 任务定时调用 on_idle_trigger()
+    - 只有在系统处于 IDLE 状态且空闲时间超过阈值时才插入 idle 动作
+    - APScheduler 任务由 AgentService 在 INITING → IDLE 转换后注册
+    """
 
     def __init__(
         self,
@@ -77,33 +87,35 @@ class IdleScheduler:
         self._thinking_motion_ids: list[UUID] = []  # ⭐ thinking 动作缓存
         self._cache_loaded = False
 
-        # 空闲调度状态
-        self._idle_loop_task: Optional[asyncio.Task] = None
+        # 空闲调度状态（不再使用 asyncio.Task）
         self._last_active_time: float = time.monotonic()
         self._running = False
+        self._idle_job_id: Optional[str] = None  # ⭐ APScheduler 任务 ID
 
         # 状态检查回调：返回 True 表示系统处于 IDLE 状态
         self._is_idle_callback: Optional[Callable[[], bool]] = None
 
     async def start(self) -> None:
-        """启动调度器"""
+        """启动调度器（只做初始化，不启动循环）
+        
+        ⭐ APScheduler 任务由 AgentService 在 INITING → IDLE 转换后注册
+        """
         self._running = True
         self._last_active_time = time.monotonic()
         self._frame_queue.set_idle_scheduler(self)
-        # 启动空闲检测循环
-        self._idle_loop_task = asyncio.create_task(self._idle_detect_loop())
-        logger.info("[IdleScheduler] 启动")
+        # ⭐ 不再启动 asyncio.sleep 循环，由外部 APScheduler 驱动
+        logger.info("[IdleScheduler] 启动（等待 APScheduler 任务注册）")
 
     async def stop(self) -> None:
-        """停止调度器"""
+        """停止调度器（移除 APScheduler 任务）"""
         self._running = False
-        if self._idle_loop_task:
-            self._idle_loop_task.cancel()
-            try:
-                await self._idle_loop_task
-            except asyncio.CancelledError:
-                pass
-            self._idle_loop_task = None
+        # ⭐ 移除 APScheduler 任务（如果已注册）
+        if self._idle_job_id:
+            from app.scheduler.scheduler import get_scheduler
+            scheduler = get_scheduler()
+            scheduler.remove_job(self._idle_job_id)
+            self._idle_job_id = None
+            logger.info(f"[IdleScheduler] APScheduler 任务已移除: {self._idle_job_id}")
         self._frame_queue.set_idle_scheduler(None)
         logger.info("[IdleScheduler] 停止")
 
@@ -127,6 +139,50 @@ class IdleScheduler:
         """
         self._is_idle_callback = callback
         logger.info("[IdleScheduler] 状态检查回调已设置")
+
+    # === APScheduler 驱动接口 ===
+
+    def set_idle_job_id(self, job_id: str) -> None:
+        """设置 APScheduler 任务 ID（由 AgentService 调用）"""
+        self._idle_job_id = job_id
+        logger.info(f"[IdleScheduler] APScheduler 任务 ID 已设置: {job_id}")
+
+    async def on_idle_trigger(self) -> Optional[float]:
+        """空闲检测触发回调（由 APScheduler 定时调用）
+        
+        检查是否满足 idle 动作插入条件：
+        1. 系统处于 IDLE 状态
+        2. 空闲时间超过 IDLE_DETECT_DELAY (20s)
+        
+        Returns:
+            下次执行的随机间隔秒数（30-60s），或 None 表示跳过
+        """
+        if not self._running:
+            return None
+
+        elapsed = time.monotonic() - self._last_active_time
+        
+        # 检查空闲时间是否超过阈值
+        if elapsed < IDLE_DETECT_DELAY:
+            logger.debug(f"[IdleScheduler] 空闲时间不足: {elapsed:.0f}s < {IDLE_DETECT_DELAY}s")
+            return None
+
+        # 检查系统是否处于 IDLE 状态
+        if self._is_idle_callback is not None:
+            if not self._is_idle_callback():
+                logger.debug(
+                    f"[IdleScheduler] 非 IDLE 状态，跳过 idle 插入 "
+                    f"(空闲时间: {elapsed:.0f}s)"
+                )
+                return None
+
+        # 满足条件，插入随机 idle 动作
+        await self._insert_random_idle()
+
+        # 返回随机间隔供 APScheduler 修改下次执行时间
+        next_interval = random.uniform(self._min_interval, self._max_interval)
+        logger.info(f"[IdleScheduler] idle 动作已插入，下次间隔: {next_interval:.0f}s")
+        return next_interval
 
     # === 1. 低水位填充：只加载 default ===
 
@@ -154,48 +210,7 @@ class IdleScheduler:
         """低水位回调（兼容接口），实际只加载 default"""
         await self.load_default(transition_from)
 
-    # === 2. 空闲检测循环：20s 无输入后随机插 idle ===
-
-    async def _idle_detect_loop(self) -> None:
-        """空闲检测主循环
-
-        只有在系统处于 IDLE 状态时才会插入随机 idle 动作。
-        """
-        logger.info("[IdleScheduler] 空闲检测循环启动")
-        while self._running:
-            try:
-                # 等待空闲检测间隔
-                await asyncio.sleep(1.0)
-
-                elapsed = time.monotonic() - self._last_active_time
-                if elapsed < IDLE_DETECT_DELAY:
-                    continue
-
-                # ⭐ 检查系统是否处于 IDLE 状态
-                if self._is_idle_callback is not None:
-                    if not self._is_idle_callback():
-                        logger.debug(
-                            f"[IdleScheduler] 非 IDLE 状态，跳过 idle 插入 "
-                            f"(空闲时间: {elapsed:.0f}s)"
-                        )
-                        # 非 IDLE 状态时继续等待，不重置计时
-                        continue
-
-                # 已空闲超过阈值且处于 IDLE 状态，插入一个随机 idle
-                await self._insert_random_idle()
-
-                # 插入后等待随机间隔再检测下一次
-                wait = random.uniform(self._min_interval, self._max_interval)
-                logger.debug(f"[IdleScheduler] 下次 idle 插入等待 {wait:.0f}s")
-                await asyncio.sleep(wait)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[IdleScheduler] 空闲检测异常: {e}")
-                await asyncio.sleep(5.0)
-
-        logger.info("[IdleScheduler] 空闲检测循环结束")
+    # === 2. 空闲动作插入（由 APScheduler 驱动）===
 
     async def _insert_random_idle(self) -> None:
         """随机选取一个 idle 动作插入帧队列"""
