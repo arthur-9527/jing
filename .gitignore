@@ -27,7 +27,6 @@ htmlcov/
 *.log
 
 # Build / Distribution
-dist/
 build/
 *.egg-info/
 
