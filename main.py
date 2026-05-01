@@ -16,13 +16,14 @@ from loguru import logger
 
 from app.config import settings
 from app.errors import AppException
-from app.database import init_db, close_db
-from app.agent.db.connection import init_db as init_agent_db, close_pool as close_agent_pool
-from app.routers import motions_router, tags_router, ws_router, agent_router
+from app.stone import init_database, close_database, init_redis_pool, close_redis_pool
+from app.routers import motions_router, tags_router, rt_router
 from app.routers.vmd_upload import router as vmd_upload_router
-from app.services.agent_service import start_agent_service, stop_agent_service
-from app.services.embedding_service import preload_embedding_model
+from app.realtime import get_realtime_manager, reset_realtime_manager
+from app.realtime.agent_service import stop_agent_service
 from app.scheduler import get_scheduler
+from app.channel.manager import ChannelManager, get_channel_manager, reset_channel_manager
+from app.channel.processor import init_channel_processor, reset_channel_processor
 
 # ===== 日志配置 =====
 log_level = settings.LOG_LEVEL.upper()
@@ -52,28 +53,25 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     print("Starting up...", flush=True)
 
-    # 初始化 SQLAlchemy 数据库（motion 表）
+    # 初始化 Stone 数据层（统一 PostgreSQL + Redis）
     try:
-        await init_db()
-        print("Database initialized")
+        await init_database()
+        print("Stone database initialized")
     except Exception as e:
-        print(f"WARNING: Database init failed: {e}")
+        print(f"WARNING: Stone database init failed: {e}")
 
-    # 初始化 Agent 数据库 schema（统一走 SQLAlchemy engine，创建 agent 表）
+    # 初始化 Redis 连接池
     try:
-        await init_agent_db()
-        print("Agent database schema initialized")
+        await init_redis_pool()
+        print("Redis pool initialized")
     except Exception as e:
-        print(f"WARNING: Agent DB init failed: {e}")
+        print(f"WARNING: Redis pool init failed: {e}")
 
     # 预加载 Embedding 模型（启动时加载到内存）
     print("Loading Embedding model...")
     import time
     from app.agent.memory.embedding import get_embedding
     try:
-        preload_embedding_model()
-        print("Embedding model loaded")
-        
         # 预热调用 - 执行一次实际推理并打印时间
         t0 = time.time()
         test_embedding = await get_embedding("系统初始化测试")
@@ -82,17 +80,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"WARNING: Embedding model load failed: {e}")
 
-    # 启动 Agent 服务（初始化 Pipeline）
-    print("Starting Agent service...")
-    try:
-        await start_agent_service()
-        print("Agent service started")
-    except Exception as e:
-        print(f"Failed to start Agent service: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # 启动定时任务调度器
+    # 启动定时任务调度器（实时流 + IM 共用）
     if settings.SCHEDULER_ENABLED:
         print("Starting Scheduler...")
         try:
@@ -101,6 +89,84 @@ async def lifespan(app: FastAPI):
             print(f"Scheduler started, jobs: {len(scheduler.get_jobs())}")
         except Exception as e:
             print(f"WARNING: Scheduler start failed: {e}")
+
+    # 启动实时语音流（Pipecat Pipeline + 情绪/好感度/Agent 服务）
+    print("Starting Realtime voice stream...")
+    try:
+        realtime_manager = get_realtime_manager()
+        await realtime_manager.start()
+        print("Realtime voice stream started")
+    except Exception as e:
+        print(f"WARNING: Realtime voice stream start failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # 启动 Channel 层（平行于实时语音流 Pipeline）
+    print("Starting Channel layer...")
+    try:
+        # 获取 ChannelManager
+        channel_manager = get_channel_manager()
+        
+        # 注册 QQChannel
+        from app.channel.providers.qq.channel import QQChannel
+        qq_channel = QQChannel()
+        channel_manager.register_channel(qq_channel)
+        print(f"QQ Channel registered: {qq_channel.channel_id}")
+        
+        # 加载角色配置并初始化 ChannelProcessor（IM LLM 模式）
+        from app.agent.character.loader import load_character
+        
+        # 获取 QQ Channel 绑定的角色 ID（从第一个 Bot 配置获取）
+        character_id = qq_channel.get_bot_character("default") or "daji"
+        print(f"Loading character config: {character_id}")
+        
+        # 加载角色配置
+        character_config_path = f"config/characters/{character_id}"
+        character_config = load_character(character_config_path)
+        
+        # 转换为字典格式
+        character_config_dict = character_config.model_dump()
+        character_config_dict["character_id"] = character_id
+        
+        # 查找参考图路径
+        reference_image_path = None
+        for ext in ["png", "jpg", "jpeg"]:
+            candidate = os.path.join(character_config_path, f"reference.{ext}")
+            if os.path.exists(candidate):
+                reference_image_path = candidate
+                print(f"Found reference image: {reference_image_path}")
+                break
+        
+        # 初始化 ChannelProcessor（IM LLM 模式，而非 Echo 模式）
+        processor = init_channel_processor(
+            character_config=character_config_dict,
+            reference_image_path=reference_image_path,
+        )
+        channel_manager.set_response_handler(processor.handle)
+        print(f"ChannelProcessor initialized (IM LLM mode), character: {character_id}")
+        
+        # 启动 ChannelManager
+        await channel_manager.start()
+        print("Channel layer started")
+    except Exception as e:
+        print(f"WARNING: Channel layer start failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # 启动日常事务调度器
+    print("Starting Daily Life Scheduler...")
+    try:
+        from app.daily_life import get_daily_life_scheduler
+        daily_life_scheduler = get_daily_life_scheduler(
+            character_id=character_id,
+            reference_image_path=reference_image_path,
+        )
+        await daily_life_scheduler.start()
+        print(f"Daily Life Scheduler started, status: {daily_life_scheduler.get_status()}")
+    except Exception as e:
+        print(f"WARNING: Daily Life Scheduler start failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     yield
 
@@ -121,7 +187,7 @@ async def lifespan(app: FastAPI):
             print(f"Error closing {name}: {e}")
 
     # 1. 关闭 HTTP 客户端
-    from app.agent.llm.providers.litellm import close_http_client
+    from app.providers.llm.litellm import close_http_client
     await _shutdown_with_timeout(close_http_client(), "HTTP client", shutdown_timeout)
 
     # 2. 关闭 Embedding 线程池
@@ -129,7 +195,7 @@ async def lifespan(app: FastAPI):
     await _shutdown_with_timeout(shutdown_embedding(), "Embedding executor", shutdown_timeout)
 
     # 3. 关闭 LipSync 线程池
-    from app.services.lipsync_service import shutdown_lipsync
+    from app.realtime.lipsync_service import shutdown_lipsync
     await _shutdown_with_timeout(shutdown_lipsync(), "LipSync executor", shutdown_timeout)
 
     # 4. 关闭定时任务调度器
@@ -138,14 +204,28 @@ async def lifespan(app: FastAPI):
         if scheduler.is_running:
             await _shutdown_with_timeout(scheduler.stop(), "Scheduler", shutdown_timeout)
 
-    # 5. 关闭 Agent 服务
+    # 5. 关闭 Channel 层
+    channel_manager = get_channel_manager()
+    if channel_manager.is_running():
+        await _shutdown_with_timeout(channel_manager.stop(), "Channel layer", shutdown_timeout)
+        reset_channel_manager()
+
+
+    # 6. 关闭实时语音流（Agent 服务 + 情绪/好感度调度器）
+    try:
+        await _shutdown_with_timeout(realtime_manager.stop(), "Realtime voice stream", shutdown_timeout)
+        reset_realtime_manager()
+    except Exception:
+        pass  # 模块可能未启动
+
+    # 7. 关闭 Agent 服务（兼容兜底）
     await _shutdown_with_timeout(stop_agent_service(), "Agent service", shutdown_timeout)
 
-    # 6. 关闭 Agent 数据库连接池
-    await _shutdown_with_timeout(close_agent_pool(), "Agent DB pool", shutdown_timeout)
+    # 8. 关闭 Redis 连接池
+    await _shutdown_with_timeout(close_redis_pool(), "Redis pool", shutdown_timeout)
 
-    # 7. 关闭主数据库
-    await _shutdown_with_timeout(close_db(), "Database", shutdown_timeout)
+    # 9. 关闭 Stone 数据库
+    await _shutdown_with_timeout(close_database(), "Stone database", shutdown_timeout)
 
 
 app = FastAPI(
@@ -225,8 +305,7 @@ app.add_middleware(
 # 注册路由
 app.include_router(motions_router)
 app.include_router(tags_router)
-app.include_router(ws_router)
-app.include_router(agent_router)
+app.include_router(rt_router)
 app.include_router(vmd_upload_router)
 
 # 挂载前端静态文件
@@ -259,42 +338,41 @@ else:
 @app.get("/health")
 async def health_check():
     """健康检查 - 检查所有依赖服务状态"""
-    from app.database import get_db_session
-    from redis import asyncio as aioredis
-    from app.config import settings
+    from sqlalchemy import text
+    from app.stone import get_database, get_redis_pool
     import time
-    
+
     health_status = {
         "status": "healthy",
         "version": "1.0.0",
         "timestamp": time.time(),
         "components": {}
     }
-    
+
     all_healthy = True
-    
-    # 1. 检查 PostgreSQL 数据库
+
+    # 1. 检查 PostgreSQL 数据库（Stone）
     try:
-        async with get_db_session() as db:
-            await db.execute("SELECT 1")
+        db = get_database()
+        async with db.get_session() as session:
+            await session.execute(text("SELECT 1"))
         health_status["components"]["database"] = {"status": "healthy", "type": "postgresql"}
     except Exception as e:
         all_healthy = False
         health_status["components"]["database"] = {"status": "unhealthy", "error": str(e)[:100]}
-    
-    # 2. 检查 Redis
+
+    # 2. 检查 Redis（Stone）
     try:
-        redis = aioredis.from_url(settings.REDIS_URL)
-        await redis.ping()
-        await redis.close()
+        redis_pool = get_redis_pool()
+        await redis_pool.get_client().ping()
         health_status["components"]["redis"] = {"status": "healthy"}
     except Exception as e:
         all_healthy = False
         health_status["components"]["redis"] = {"status": "unhealthy", "error": str(e)[:100]}
-    
+
     # 3. 检查 Agent 服务状态
     try:
-        from app.services.agent_service import get_agent_service
+        from app.realtime.agent_service import get_agent_service
         service = get_agent_service()
         if service and service.is_running:
             health_status["components"]["agent_service"] = {
@@ -310,28 +388,19 @@ async def health_check():
             }
     except Exception as e:
         health_status["components"]["agent_service"] = {"status": "unhealthy", "error": str(e)[:100]}
-    
-    # 4. 检查 Agent 数据库
-    try:
-        from app.agent.db.connection import get_agent_db_session
-        async with get_agent_db_session() as db:
-            await db.execute("SELECT 1")
-        health_status["components"]["agent_database"] = {"status": "healthy"}
-    except Exception as e:
-        health_status["components"]["agent_database"] = {"status": "unhealthy", "error": str(e)[:100]}
-    
+
     # 设置整体状态
     if not all_healthy:
         health_status["status"] = "degraded"
-    
+
     return health_status
 
 
 @app.get("/ready")
 async def readiness_check():
     """就绪检查 - 检查服务是否完全启动并准备好接收请求"""
-    from app.services.agent_service import get_agent_service
-    from app.services.init_gate import get_init_gate
+    from app.realtime.agent_service import get_agent_service
+    from app.realtime.init_gate import get_init_gate
     
     gate = get_init_gate()
     service = get_agent_service()

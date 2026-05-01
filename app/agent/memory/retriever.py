@@ -4,7 +4,7 @@
 - 混合检索策略：快速路径 + 向量层级检索
 - Phase 1: 快速路径 - 最近记忆（日记向量搜索）
 - Phase 2: 向量层级检索 - 久远记忆（年→月→周→日）
-- 支持 PostgreSQL FTS 全文检索（关键事件）
+- 支持 PostgreSQL FTS 全文检索（关键事件、心动事件）
 - Context 预算裁剪
 
 检索流程：
@@ -13,11 +13,18 @@
   Step 3: 向量搜索（快速路径 → 层级检索）
   Step 4: 获取日记内容 + 关联事件
 
-短期记忆检索（简化版）：
-  - 最近3天聊天记录
-  - 最近7天心动事件（高强度）
-  - 所有特殊事件（preference/fact/schedule/initiative）
+短期记忆检索（FTS 模式）：
+  - 最近3天聊天记录（FTS 匹配）
+  - 全部心动事件（FTS 匹配，不限时间）
+  - 所有特殊事件（FTS 匹配）
+  - 使用用户原始输入进行 FTS，利用 zhparser + scws 自动分词
   - 使用字数裁剪替代 token 计算，节省时间
+
+长期记忆检索（向量模式）：
+  - 由 long_term_deep.py 处理
+  - 使用用户原始输入生成 embedding（语义更完整）
+  - 层级向量检索（年→月→周→日）
+  - heartbeat 心动时刻不在长期记忆检索范围内
 """
 
 from __future__ import annotations
@@ -29,30 +36,146 @@ from typing import Optional
 
 import tiktoken
 
-from app.agent.db.models import search_background
-from app.agent.db.memory_models import (
-    get_recent_key_events,
-    get_high_intensity_heartbeat_events,
-    search_key_events_fts,
-    search_chat_messages_fts,
-    search_heartbeat_events_fts,
-    get_chat_context_around_message,
-    batch_get_chat_contexts,  # 新增：批量上下文获取
-    get_recent_chat_messages,
-    get_special_events,
-    # 向量搜索函数
-    search_annual_by_embedding,
-    search_monthly_by_embedding,
-    search_weekly_by_embedding,
-    search_diary_by_embedding,
-    # 获取详情
-    get_daily_diary,
-    get_key_events_by_ids,
-    get_heartbeat_events_by_ids,
+from app.stone import (
+    get_background_repo,
+    get_key_event_repo,
+    get_heartbeat_repo,
+    get_chat_repo,
+    get_diary_repo,
+    get_weekly_repo,
+    get_monthly_repo,
+    get_annual_repo,
 )
 from app.agent.memory.embedding import get_embedding
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 二级分拣策略：停用词 + 关键词提取
+# ---------------------------------------------------------------------------
+
+# 中文停用词表（用于 FTS 查询优化）
+STOPWORDS_CN = {
+    # 常见停用词
+    "是", "的", "了", "在", "有", "和", "与", "或", "这", "那", "它", "他", "她",
+    "我", "你", "们", "自己", "什么", "怎么", "为什么", "哪", "哪里", "哪个",
+    "多少", "几", "怎样", "如何", "吗", "呢", "吧", "啊", "哦", "嗯", "呀",
+    "就", "都", "也", "还", "又", "但", "却", "只", "能", "会", "要", "想",
+    "说", "看", "做", "去", "来", "让", "给", "把", "被", "从", "到", "对",
+    "很", "太", "挺", "好", "坏", "多", "少", "大", "小", "高", "低", "长", "短",
+    # 时间停用词
+    "今天", "昨天", "明天", "刚才", "现在", "以后", "之前", "当时", "那时候",
+    # 常见动词（信息量低）
+    "觉得", "认为", "以为", "知道", "了解", "明白", "理解", "记得", "忘记",
+    # 常见形容词（信息量低）
+    "一般", "普通", "正常", "特别", "非常", "十分", "极其",
+}
+
+def extract_core_keywords(query: str) -> list[str]:
+    """提取核心关键词（去掉停用词）
+    
+    Args:
+        query: 用户原始输入
+    
+    Returns:
+        核心关键词列表（用于 OR 查询召回）
+    
+    Example:
+        "我的生日是哪天" → ["生日"]
+        "豆豆喜欢吃什么" → ["豆豆", "喜欢", "吃"]
+        "我喜欢什么歌" → ["喜欢", "歌"]
+    """
+    import jieba
+    
+    # 使用 jieba 分词
+    tokens = list(jieba.cut(query))
+    
+    # 过滤停用词和单字符（除非是关键单字如"歌"、"吃"等）
+    core_keywords = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        # 跳过停用词
+        if token in STOPWORDS_CN:
+            continue
+        # 跳过纯数字
+        if token.isdigit():
+            continue
+        # 跳过单字符停用词
+        if len(token) == 1 and token not in {"歌", "吃", "喝", "玩", "看", "听", "买", "送", "去", "来"}:
+            continue
+        core_keywords.append(token)
+    
+    logger.info(f"[二级分拣] 原始查询: '{query}' → 核心关键词: {core_keywords}")
+    return core_keywords
+
+
+def calculate_match_ratio(query_tokens: list[str], content: str) -> float:
+    """计算查询词在内容中的占有率（二级分拣排序）
+    
+    Args:
+        query_tokens: 原始查询分词列表（包含停用词）
+        content: 记录内容
+    
+    Returns:
+        占有率 (0.0 - 1.0)
+    
+    Example:
+        query_tokens = ["我的", "生日", "是", "哪天"]  # 4个词
+        content = "用户的生日是3月15日"  # 匹配 "生日" 和 "是"
+        占有率 = 2/4 = 0.5
+    """
+    if not query_tokens or not content:
+        return 0.0
+    
+    import jieba
+    
+    # 对内容分词
+    content_tokens = set(jieba.cut(content))
+    
+    # 计算匹配数量
+    matched_count = 0
+    for token in query_tokens:
+        if token in content_tokens:
+            matched_count += 1
+    
+    ratio = matched_count / len(query_tokens)
+    return ratio
+
+
+def sort_by_match_ratio(results: list[dict], query: str, text_key: str = "content") -> list[dict]:
+    """按占有率排序（二级分拣第二级）
+    
+    Args:
+        results: FTS 返回的结果列表
+        query: 原始查询
+        text_key: 文本字段名
+    
+    Returns:
+        按占有率降序排序的结果列表
+    """
+    import jieba
+    
+    # 原始查询分词
+    query_tokens = list(jieba.cut(query))
+    
+    # 计算每条记录的占有率
+    for item in results:
+        content = item.get(text_key, "")
+        ratio = calculate_match_ratio(query_tokens, content)
+        item["_match_ratio"] = ratio
+    
+    # 按占有率降序排序（高占有率排在前面）
+    results.sort(key=lambda x: (x.get("_match_ratio", 0), x.get("rank", 0)), reverse=True)
+    
+    # 打印排序结果（调试）
+    if results:
+        logger.info(f"[二级分拣] 排序结果:")
+        for i, item in enumerate(results[:5]):
+            logger.info(f"  #{i+1} 占有率={item.get('_match_ratio', 0):.2f}, content={item.get(text_key, '')[:30]}...")
+    
+    return results
 
 # Context 预算（tokens）
 BUDGET_BACKGROUND = 500
@@ -138,20 +261,29 @@ async def retrieve_memories(
     # Step 2: Phase 1 - 快速路径（并行检索）
     t_phase1 = time.monotonic()
     
+    # 使用 Stone Repository
+    background_repo = get_background_repo()
+    
     # 背景知识（向量检索）
-    bg_task = search_background(character_id, query_embedding, limit=10)
+    bg_task = background_repo.search_vector(character_id, query_embedding, limit=10)
+    key_event_repo = get_key_event_repo()
+    heartbeat_repo = get_heartbeat_repo()
+    chat_repo = get_chat_repo()
+    diary_repo = get_diary_repo()
+    annual_repo = get_annual_repo()
+    weekly_repo = get_weekly_repo()
     
     # 关键事件（最近7天）
-    ke_task = get_recent_key_events(character_id, user_id, days=7, limit=20)
+    ke_task = key_event_repo.get_recent(character_id, user_id, days=7, limit=20)
     
     # 心动事件（高强度）
-    hb_task = get_high_intensity_heartbeat_events(character_id, user_id, min_intensity=0.5, limit=10)
+    hb_task = heartbeat_repo.get_high_intensity(character_id, user_id, min_intensity=0.5, limit=10)
     
     # 最近聊天记录
-    chat_task = get_recent_chat_messages(character_id, user_id, limit=20, days=3)
+    chat_task = chat_repo.get_recent(character_id, user_id, limit=20, days=3)
     
     # 最近日记向量搜索（快速路径核心）
-    diary_task = search_diary_by_embedding(character_id, user_id, query_embedding, limit=5)
+    diary_task = diary_repo.search_vector(character_id, user_id, query_embedding, limit=5)
     
     bg_results, ke_results, hb_results, chat_results, diary_results = await asyncio.gather(
         bg_task, ke_task, hb_task, chat_task, diary_task
@@ -282,8 +414,14 @@ async def _hierarchical_vector_search(
     
     results = []
     
+    # 获取 Repository 实例
+    annual_repo = get_annual_repo()
+    monthly_repo = get_monthly_repo()
+    weekly_repo = get_weekly_repo()
+    diary_repo = get_diary_repo()
+    
     # Step 1: 搜索年索引
-    annual_matches = await search_annual_by_embedding(
+    annual_matches = await annual_repo.search_vector(
         character_id, user_id, query_embedding, limit=3
     )
     
@@ -308,7 +446,7 @@ async def _hierarchical_vector_search(
             if month_hint:
                 # 直接搜索该月
                 logger.info(f"[Hierarchical]   跳级到 {year}年{month_hint}月")
-                monthly = await search_monthly_by_embedding(
+                monthly = await monthly_repo.search_vector(
                     character_id, user_id, query_embedding, 
                     year=year, limit=3
                 )
@@ -321,7 +459,7 @@ async def _hierarchical_vector_search(
                 continue
         
         # 正常流程：搜索该年的月索引
-        monthly_matches = await search_monthly_by_embedding(
+        monthly_matches = await monthly_repo.search_vector(
             character_id, user_id, query_embedding, 
             year=year, limit=5
         )
@@ -363,20 +501,20 @@ async def _search_down_from_monthly(
         # 如果月索引匹配度高，可以跳级直接查日记
         if monthly_similarity >= SIMILARITY_THRESHOLD_HIGH:
             # 查询该月的日记
-            diary_matches = await search_diary_by_embedding(
+            diary_matches = await diary_repo.search_vector(
                 character_id, user_id, query_embedding, limit=5
             )
             # 过滤到该月
             diary_matches = [
                 d for d in diary_matches 
-                if d.get("diary_date", "").startswith(f"{year}-{month:02d}")
+                if str(d.get("diary_date", "")).startswith(f"{year}-{month:02d}")
             ]
             if diary_matches:
                 results.extend(diary_matches)
                 continue
         
         # 搜索该月的周索引
-        weekly_matches = await search_weekly_by_embedding(
+        weekly_matches = await weekly_repo.search_vector(
             character_id, user_id, query_embedding, limit=5
         )
         
@@ -395,14 +533,14 @@ async def _search_down_from_monthly(
             logger.info(f"[Hierarchical]       周 {week_start}~{week_end} (相似度: {weekly_similarity:.2f})")
             
             # 搜索日记
-            diary_matches = await search_diary_by_embedding(
+            diary_matches = await diary_repo.search_vector(
                 character_id, user_id, query_embedding, limit=5
             )
             
             # 过滤到该周
             diary_matches = [
                 d for d in diary_matches 
-                if week_start <= d.get("diary_date", "") <= week_end
+                if str(week_start) <= str(d.get("diary_date", "")) <= str(week_end)
             ]
             
             if diary_matches:
@@ -419,11 +557,17 @@ async def _parallel_vector_search(
     """并行搜索所有层级（Fallback）"""
     logger.info("[Hierarchical] 并行向量搜索")
     
+    # 获取 Repository 实例
+    annual_repo = get_annual_repo()
+    monthly_repo = get_monthly_repo()
+    weekly_repo = get_weekly_repo()
+    diary_repo = get_diary_repo()
+    
     # 并行搜索所有层级
-    annual_task = search_annual_by_embedding(character_id, user_id, query_embedding, limit=3)
-    monthly_task = search_monthly_by_embedding(character_id, user_id, query_embedding, limit=5)
-    weekly_task = search_weekly_by_embedding(character_id, user_id, query_embedding, limit=7)
-    diary_task = search_diary_by_embedding(character_id, user_id, query_embedding, limit=10)
+    annual_task = annual_repo.search_vector(character_id, user_id, query_embedding, limit=3)
+    monthly_task = monthly_repo.search_vector(character_id, user_id, query_embedding, limit=5)
+    weekly_task = weekly_repo.search_vector(character_id, user_id, query_embedding, limit=7)
+    diary_task = diary_repo.search_vector(character_id, user_id, query_embedding, limit=10)
     
     annual, monthly, weekly, diary = await asyncio.gather(
         annual_task, monthly_task, weekly_task, diary_task
@@ -504,15 +648,19 @@ async def _expand_diary_events(diary_results: list[dict]) -> str:
     if not key_event_ids and not heartbeat_ids:
         return ""
     
+    # 获取 Repository 实例
+    key_event_repo = get_key_event_repo()
+    heartbeat_repo = get_heartbeat_repo()
+    
     # 批量获取事件详情
     key_events = []
     heartbeat_events = []
     
     if key_event_ids:
-        key_events = await get_key_events_by_ids(key_event_ids[:20])
+        key_events = await key_event_repo.get_by_ids(key_event_ids[:20])
     
     if heartbeat_ids:
-        heartbeat_events = await get_heartbeat_events_by_ids(heartbeat_ids[:10])
+        heartbeat_events = await heartbeat_repo.get_by_ids(heartbeat_ids[:10])
     
     # 格式化输出
     lines = []
@@ -650,7 +798,8 @@ async def retrieve_key_events_fts(
     Returns:
         匹配的关键事件列表
     """
-    return await search_key_events_fts(
+    key_event_repo = get_key_event_repo()
+    return await key_event_repo.search_fts(
         character_id=character_id,
         user_id=user_id,
         query=query,
@@ -659,35 +808,166 @@ async def retrieve_key_events_fts(
     )
 
 
-# ---------------------------------------------------------------------------
-# 旧接口兼容层（deprecated，将逐步移除）
-# ---------------------------------------------------------------------------
-
-async def retrieve_memories_legacy(
+async def search_key_events_multi_keywords(
     character_id: str,
     user_id: str,
-    user_input: str,
-) -> dict[str, str]:
+    keywords: list[str],
+    event_types: list[str] | None = None,
+    limit: int = 5,
+) -> list[dict]:
     """
-    [已废弃] 旧版三轨检索接口，保留兼容性
+    并行搜索多个关键词，合并去重
+
+    流程：
+    1. 并行搜索每个关键词
+    2. 合并结果
+    3. 按 rank 排序去重
+    4. 返回 top N
+
+    Args:
+        character_id: 角色ID
+        user_id: 用户ID
+        keywords: 关键词列表
+        event_types: 限定事件类型
+        limit: 返回条数
+
+    Returns:
+        合并后的检索结果
     """
-    logger.warning("retrieve_memories_legacy 已废弃，请使用 retrieve_memories")
-    
-    # 调用新接口
-    result = await retrieve_memories(character_id, user_id, user_input)
-    
-    # 转换为旧格式
-    return {
-        "background": result["background"],
-        "emotion": result["heartbeat"],  # heartbeat 替代 emotion
-        "user_history": result["key_events"],  # key_events 替代 user_history
-        "combined": result["combined"],
-    }
+    if not keywords:
+        return []
+
+    key_event_repo = get_key_event_repo()
+
+    # 并行搜索每个关键词
+    tasks = [
+        key_event_repo.search_fts(
+            character_id, user_id, kw,
+            limit=limit,
+            event_types=event_types,
+        )
+        for kw in keywords
+    ]
+
+    results_list = await asyncio.gather(*tasks)
+
+    # 合并去重
+    seen_ids = set()
+    merged_results = []
+
+    for results in results_list:
+        for r in results:
+            r_id = r.get("id")
+            if r_id and r_id not in seen_ids:
+                seen_ids.add(r_id)
+                merged_results.append(r)
+
+    # 按 rank 降序排序
+    merged_results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+
+    # 截取 limit 条
+    return merged_results[:limit]
 
 
-# ---------------------------------------------------------------------------
-# 短期记忆检索（简化版，字数裁剪）
-# ---------------------------------------------------------------------------
+async def search_chat_messages_multi_keywords(
+    character_id: str,
+    user_id: str,
+    keywords: list[str],
+    days: int = 3,
+    limit: int = 3,
+) -> list[dict]:
+    """
+    并行搜索多个关键词，合并去重
+
+    Args:
+        character_id: 角色ID
+        user_id: 用户ID
+        keywords: 关键词列表
+        days: 搜索最近N天
+        limit: 返回条数
+
+    Returns:
+        合并后的检索结果
+    """
+    if not keywords:
+        return []
+
+    chat_repo = get_chat_repo()
+
+    # 并行搜索
+    tasks = [
+        chat_repo.search_fts(character_id, user_id, kw, limit=limit, days=days)
+        for kw in keywords
+    ]
+
+    results_list = await asyncio.gather(*tasks)
+
+    # 合并去重
+    seen_ids = set()
+    merged_results = []
+
+    for results in results_list:
+        for r in results:
+            r_id = r.get("id")
+            if r_id and r_id not in seen_ids:
+                seen_ids.add(r_id)
+                merged_results.append(r)
+
+    # 按 rank 排序
+    merged_results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+
+    return merged_results[:limit]
+
+
+async def search_heartbeat_multi_keywords(
+    character_id: str,
+    user_id: str,
+    keywords: list[str],
+    days: int = 7,
+    limit: int = 3,
+) -> list[dict]:
+    """
+    并行搜索多个关键词，合并去重
+
+    Args:
+        character_id: 角色ID
+        user_id: 用户ID
+        keywords: 关键词列表
+        days: 搜索最近N天
+        limit: 返回条数
+
+    Returns:
+        合并后的检索结果
+    """
+    if not keywords:
+        return []
+
+    heartbeat_repo = get_heartbeat_repo()
+
+    # 并行搜索
+    tasks = [
+        heartbeat_repo.search_fts(character_id, user_id, kw, limit=limit, days=days)
+        for kw in keywords
+    ]
+
+    results_list = await asyncio.gather(*tasks)
+
+    # 合并去重
+    seen_ids = set()
+    merged_results = []
+
+    for results in results_list:
+        for r in results:
+            r_id = r.get("id")
+            if r_id and r_id not in seen_ids:
+                seen_ids.add(r_id)
+                merged_results.append(r)
+
+    # 按 rank 排序
+    merged_results.sort(key=lambda x: x.get("rank", 0), reverse=True)
+
+    return merged_results[:limit]
+
 
 # 字数限制（替代 token 计算，节省 ~50ms tiktoken 编码时间）
 MAX_CHARS_CHAT = 500       # 最近聊天记录
@@ -730,44 +1010,76 @@ async def retrieve_short_term_memories(
     user_input: str = "",
 ) -> dict[str, str]:
     """
-    短期记忆检索（FTS 匹配 + 上下文获取）
+    短期记忆检索（二级分拣策略：停用词过滤 + OR召回 + 占有率排序）
+
+    二级分拣策略：
+    - 第一级：提取核心关键词，OR 查询召回（高召回率）
+    - 第二级：按原始查询词在结果中的占有率排序（高准确率）
     
     根据用户输入进行 FTS 匹配，获取相关记忆：
-    1. 聊天记录：FTS 匹配最近3天，获取上下文（最多3条匹配，每条上下文最多6条）
-    2. 心动事件：FTS 匹配最近7天（最多3条）
-    3. 特殊事件：FTS 匹配（最多5条）
+    1. 聊天记录：FTS 匹配最近3天，获取上下文
+    2. 心动事件：FTS 匹配全部（不限时间）
+    3. 特殊事件：FTS 匹配
     
     如果 user_input 为空，则回退到固定加载模式。
-    
+
     Args:
         character_id: 角色ID
         user_id: 用户ID
         user_input: 用户输入（用于 FTS 匹配）
-    
+
     Returns:
         包含短期记忆上下文的字典
     """
     t0 = time.monotonic()
-    
+
+    # 获取 Repository 实例
+    chat_repo = get_chat_repo()
+    key_event_repo = get_key_event_repo()
+    heartbeat_repo = get_heartbeat_repo()
+
     # 如果没有用户输入，回退到固定加载
     if not user_input or not user_input.strip():
         logger.info("[短期记忆] 无用户输入，回退到固定加载模式")
         return await _retrieve_short_term_memories_fallback(character_id, user_id)
-    
+
     logger.info(f"[短期记忆] FTS 查询: '{user_input}'")
     
-    # 并行执行 FTS 检索
-    chat_fts_task = search_chat_messages_fts(
-        character_id, user_id, user_input, limit=3, days=3
-    )
-    hb_fts_task = search_heartbeat_events_fts(
-        character_id, user_id, user_input, limit=3, days=7
-    )
-    se_fts_task = search_key_events_fts(
-        character_id, user_id, user_input, 
-        limit=5, 
-        event_types=['preference', 'fact', 'schedule', 'initiative']
-    )
+    # ============================================================
+    # 二级分拣策略：第一级 - 提取核心关键词，OR 查询召回
+    # ============================================================
+    core_keywords = extract_core_keywords(user_input)
+    
+    # 如果提取到核心关键词，使用 OR 语义查询
+    if core_keywords:
+        logger.info(f"[二级分拣] 使用 OR 语义查询，核心关键词: {core_keywords}")
+        
+        # 并行执行三个 FTS 检索（使用 OR 语义）
+        chat_fts_task = chat_repo.search_fts(
+            character_id, user_id, " ".join(core_keywords), limit=10, days=3
+        )
+        hb_fts_task = heartbeat_repo.search_fts(
+            character_id, user_id, " ".join(core_keywords), limit=10, days=None
+        )
+        se_fts_task = key_event_repo.search_fts(
+            character_id, user_id, " ".join(core_keywords),
+            limit=20,
+            event_types=['preference', 'fact', 'schedule', 'initiative'],
+        )
+    else:
+        # 没有核心关键词，直接使用原始输入
+        logger.info("[短期记忆] 使用 zhparser + scws 自动分词")
+        chat_fts_task = chat_repo.search_fts(
+            character_id, user_id, user_input, limit=5, days=3
+        )
+        hb_fts_task = heartbeat_repo.search_fts(
+            character_id, user_id, user_input, limit=5, days=None
+        )
+        se_fts_task = key_event_repo.search_fts(
+            character_id, user_id, user_input,
+            limit=10,
+            event_types=['preference', 'fact', 'schedule', 'initiative']
+        )
     
     chat_fts_results, hb_fts_results, se_fts_results = await asyncio.gather(
         chat_fts_task, hb_fts_task, se_fts_task
@@ -777,6 +1089,20 @@ async def retrieve_short_term_memories(
     logger.info(f"[Timing]   - chat FTS: {len(chat_fts_results)} 条")
     logger.info(f"[Timing]   - heartbeat FTS: {len(hb_fts_results)} 条")
     logger.info(f"[Timing]   - special_events FTS: {len(se_fts_results)} 条")
+    
+    # ============================================================
+    # 二级分拣策略：第二级 - 按占有率排序
+    # ============================================================
+    if core_keywords and se_fts_results:
+        se_fts_results = sort_by_match_ratio(se_fts_results, user_input, text_key="content")
+        # 截取前 10 条
+        se_fts_results = se_fts_results[:10]
+        logger.info(f"[二级分拣] 特殊事件排序后: {len(se_fts_results)} 条")
+    
+    if core_keywords and hb_fts_results:
+        hb_fts_results = sort_by_match_ratio(hb_fts_results, user_input, text_key="trigger_text")
+        hb_fts_results = hb_fts_results[:5]
+        logger.info(f"[二级分拣] 心动事件排序后: {len(hb_fts_results)} 条")
     
     # 处理聊天记录上下文
     t_chat = time.monotonic()
@@ -790,7 +1116,7 @@ async def retrieve_short_term_memories(
         seen_message_ids.add(msg_id)
         
         # 获取上下文（前后各1条 = 总共最多5条：前1+匹配1+后1，但可能有user/assistant交替）
-        context = await get_chat_context_around_message(
+        context = await chat_repo.get_context_around_message(
             character_id, user_id, msg_id,
             context_before=2, context_after=2
         )
@@ -829,15 +1155,20 @@ async def _retrieve_short_term_memories_fallback(
     """固定加载模式（无用户输入时的回退方案）"""
     t0 = time.monotonic()
     
+    # 获取 Repository 实例
+    chat_repo = get_chat_repo()
+    heartbeat_repo = get_heartbeat_repo()
+    key_event_repo = get_key_event_repo()
+    
     # 并行检索三种数据
-    chat_task = get_recent_chat_messages(character_id, user_id, limit=10, days=3)
-    hb_task = get_high_intensity_heartbeat_events(
+    chat_task = chat_repo.get_recent(character_id, user_id, limit=10, days=3)
+    hb_task = heartbeat_repo.get_high_intensity(
         character_id, user_id, 
         min_intensity=0.5, 
         limit=5,
         days=7
     )
-    se_task = get_special_events(character_id, user_id, limit=30)
+    se_task = key_event_repo.get_special_events(character_id, user_id, days_ahead=30)
     
     chat_results, hb_results, se_results = await asyncio.gather(
         chat_task, hb_task, se_task

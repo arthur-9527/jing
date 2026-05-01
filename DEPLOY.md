@@ -85,21 +85,29 @@ make
 sudo make install
 ```
 
-### 5. 导入 SQL 脚本（按顺序）
+### 5. 导入 SQL 脚本
+
+数据库表结构已拆分为模块化 SQL 文件，可使用统一入口一键初始化：
 
 ```bash
 # 设置密码环境变量
 export PGPASSWORD=your_password
 
-# 1. 主数据库初始化（创建所有表）
-psql -U admin -d agent_backend -h localhost -f sql/init_db.sql
+# 统一初始化（推荐，自动按顺序加载所有 SQL 文件）
+sudo -u postgres psql -f sql/init_all.sql
 
-# 2. 中文分词列（需要 zhparser）
-psql -U admin -d agent_backend -h localhost -f sql/add_chinese_fts_columns.sql
-
-# 3. 心跳 FTS 索引
-psql -U admin -d agent_backend -h localhost -f sql/add_heartbeat_fts.sql
+# 或者逐文件导入：
+# psql -U admin -d agent_backend -h localhost -f sql/00_extensions.sql
+# psql -U admin -d agent_backend -h localhost -f sql/01_motion.sql
+# psql -U admin -d agent_backend -h localhost -f sql/02_agent.sql
+# psql -U admin -d agent_backend -h localhost -f sql/03_memory.sql
+# psql -U admin -d agent_backend -h localhost -f sql/04_affection.sql
+# psql -U admin -d agent_backend -h localhost -f sql/05_daily_life.sql
+# psql -U admin -d agent_backend -h localhost -f sql/06_im_channel.sql
+# psql -U admin -d agent_backend -h localhost -f sql/07_fts_columns.sql
 ```
+
+> `init_all.sql` 会自动连接 `agent_backend` 数据库并依次加载 00-07 共 8 个 SQL 文件，创建包含 Motion、Agent、Memory、Affection、Daily Life、IM Channel 在内的 19 张表。
 
 ### 6. 安装 Python 依赖
 
@@ -138,24 +146,33 @@ cp .env.example .env
 DATABASE_URL=postgresql+asyncpg://admin:your_password@localhost:5432/agent_backend
 
 # Redis 连接 URL
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://localhost:6379/1
 ```
 
 #### Embedding 模型配置
 
 ```bash
-LOCAL_EMBEDDING_ENABLED=true
-LOCAL_EMBEDDING_MODEL_PATH=models/embedding
+LOCAL_EMBEDDING_MODEL_PATH=./models/embedding
 EMBEDDING_DIM=512
 ```
 
-#### LLM API 配置（必需）
+#### LLM Provider 配置（必需）
 
 ```bash
-LLM_PROVIDER=cerebras
-LLM_API_BASE_URL=http://your-llm-server:4000/v1
-LLM_API_KEY=your_api_key
-LLM_MODEL=qwen3-chat
+# LiteLLM Provider（OpenAI 兼容 API）
+LITELLM_API_BASE_URL=http://your-llm-server:4000/v1
+LITELLM_API_KEY=your_api_key
+LITELLM_MODEL=qwen3-chat
+
+# Cerebras Provider（可选）
+CEREBRAS_API_BASE_URL=http://your-llm-server:4000
+CEREBRAS_API_KEY=your_api_key
+CEREBRAS_MODEL=qwen3-chat
+
+# 服务 Provider 选择器
+CHAT_PROVIDER=litellm
+VISION_PROVIDER=litellm
+VISION_MODEL=qwen-vl-plus
 ```
 
 #### DashScope API（必需，用于 ASR/TTS）
@@ -167,7 +184,7 @@ DASHSCOPE_API_KEY=your_dashscope_key
 #### OpenClaw WebSocket（必需）
 
 ```bash
-OPENCLAW_WS_URL=ws://localhost:18789/gateway
+OPENCLAW_WS_URL=ws://127.0.0.1:18789/gateway
 OPENCLAW_WS_TOKEN=your_token
 ```
 
@@ -210,21 +227,27 @@ open http://localhost:8000/docs
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
 | `DATABASE_URL` | PostgreSQL 连接 URL | `postgresql+asyncpg://admin:password@localhost:5432/agent_backend` |
-| `REDIS_URL` | Redis 连接 URL | `redis://localhost:6379/0` |
+| `REDIS_URL` | Redis 连接 URL | `redis://localhost:6379/1` |
 | `DASHSCOPE_API_KEY` | 阿里云 DashScope API Key | `sk-xxx` |
-| `LLM_API_BASE_URL` | LLM 服务地址 | `http://your-llm-server:4000/v1` |
-| `LLM_API_KEY` | LLM API Key | `sk-xxx` |
-| `OPENCLAW_WS_URL` | OpenClaw WebSocket 地址 | `ws://localhost:18789/gateway` |
+| `LITELLM_API_BASE_URL` | LiteLLM 服务地址 | `http://your-llm-server:4000/v1` |
+| `LITELLM_API_KEY` | LiteLLM API Key | `sk-xxx` |
+| `OPENCLAW_WS_URL` | OpenClaw WebSocket 地址 | `ws://127.0.0.1:18789/gateway` |
 | `OPENCLAW_WS_TOKEN` | OpenClaw WebSocket Token | `your_token` |
 
 ### 可选配置项
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `LLM_PROVIDER` | `cerebras` | LLM 提供商 (`litellm` / `cerebras`) |
-| `LLM_MODEL` | `qwen3-chat` | LLM 模型名称 |
+| `CHAT_PROVIDER` | `litellm` | 对话 LLM 提供商 (`litellm` / `cerebras`) |
+| `LITELLM_MODEL` | `qwen3-chat` | LiteLLM 模型名称 |
+| `THINKING_PROVIDER` | `litellm` | 思考服务 LLM 提供商 |
+| `VISION_PROVIDER` | `litellm` | 视觉服务提供商 |
+| `VISION_MODEL` | `qwen-vl-plus` | 视觉模型名称 |
 | `ASR_PROVIDER` | `qwen` | ASR 提供商 (`qwen` / `deepgram`) |
-| `TTS_PROVIDER` | `cosyvoice_ws` | TTS 提供商 (`cosyvoice_ws` / `cartesia`) |
+| `TTS_PROVIDER` | `cosyvoice` | TTS 提供商 (`cosyvoice` / `cartesia`) |
+| `POST_PROCESS_ENABLED` | `true` | 是否启用回复二次改写 |
+| `SCHEDULER_ENABLED` | `true` | 是否启用定时任务调度 |
+| `DAILY_LIFE_ENABLED` | `true` | 是否启用每日生活系统 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `PORT` | `8000` | 服务端口 |
 
@@ -237,6 +260,37 @@ open http://localhost:8000/docs
 ./scripts/download-embedding-model.sh
 
 # 模型将保存到 ./models/embedding 目录
+```
+
+### QQ Bot 配置
+
+如需启用 QQ Bot 功能，在 `.env` 中配置：
+
+```bash
+QQ_BOT_APPID=your_qq_bot_appid
+QQ_BOT_SECRET=your_qq_bot_secret
+```
+
+### 每日生活配置
+
+角色自主行为系统，启用后角色会根据时间段主动发起问候和行为：
+
+```bash
+DAILY_LIFE_ENABLED=true
+```
+
+事件配置位于 `app/daily_life/` 模块中。
+
+### 图片/视频生成配置
+
+支持通过 DashScope 进行图生图和图生视频：
+
+```bash
+IMAGE_VIDEO_GEN_ENABLED=false
+IMAGE_GEN_PROVIDER=dashscope
+VIDEO_GEN_PROVIDER=dashscope
+DASHSCOPE_IMAGE_GEN_MODEL=wanx2.1-t2i-plus
+DASHSCOPE_VIDEO_GEN_MODEL=wanx2.1-i2v-plus
 ```
 
 ### 角色配置
@@ -345,7 +399,7 @@ example_motion/
 **解决方案**：使用 `-h localhost` 参数通过 TCP 连接，避免 Unix socket 的 peer 认证：
 
 ```bash
-psql -U admin -d agent_backend -h localhost -f sql/init_db.sql
+psql -U admin -d agent_backend -h localhost -f sql/init_all.sql
 ```
 
 ### 缺少 redis Python 包
@@ -362,14 +416,14 @@ pip install redis
 
 错误信息：`column "content_tsv_cn" does not exist`
 
-**解决方案**：需要先安装 zhparser 中文分词扩展，然后执行 `sql/add_chinese_fts_columns.sql`：
+**解决方案**：需要先安装 zhparser 中文分词扩展，然后执行 `sql/07_fts_columns.sql`：
 
 ```bash
 # 确认 zhparser 已安装
 psql -U admin -d agent_backend -h localhost -c "SELECT * FROM pg_extension WHERE extname='zhparser';"
 
 # 执行中文分词列 SQL
-psql -U admin -d agent_backend -h localhost -f sql/add_chinese_fts_columns.sql
+psql -U admin -d agent_backend -h localhost -f sql/07_fts_columns.sql
 ```
 
 ### zhparser 安装失败
@@ -493,8 +547,14 @@ pytest tests/test_ws_connection.py -v
 
 | 文件 | 说明 | 依赖 |
 |------|------|------|
-| `sql/init_db.sql` | 主数据库初始化，创建所有表 | pgvector, uuid-ossp |
-| `sql/add_chinese_fts_columns.sql` | 添加中文全文搜索列 | zhparser |
-| `sql/add_heartbeat_fts.sql` | 添加心跳事件 FTS 索引 | init_db.sql |
+| `sql/00_extensions.sql` | 安装 pgvector, uuid-ossp, zhparser 扩展 | PostgreSQL 16+ |
+| `sql/01_motion.sql` | Motion 动作相关表（motions, keyframes, tags） | 00_extensions |
+| `sql/02_agent.sql` | Agent 角色相关表（background, emotion, state） | 00_extensions |
+| `sql/03_memory.sql` | Memory 记忆层级表（chat, events, diary, indexes） | 00_extensions |
+| `sql/04_affection.sql` | Affection 好感度状态表 | 00_extensions |
+| `sql/05_daily_life.sql` | Daily Life 每日生活事件表 | 00_extensions |
+| `sql/06_im_channel.sql` | IM Channel 用户和平台绑定表 | 00_extensions |
+| `sql/07_fts_columns.sql` | 中文全文搜索列（需要 zhparser） | 03_memory |
+| `sql/init_all.sql` | 统一入口，自动按顺序加载以上所有文件 | - |
 
-**导入顺序**：`init_db.sql` → `add_chinese_fts_columns.sql` → `add_heartbeat_fts.sql`
+**导入方式**：直接使用 `sudo -u postgres psql -f sql/init_all.sql` 一键初始化，或按编号顺序逐文件导入。

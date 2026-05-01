@@ -2,22 +2,23 @@
 
 功能：
 1. 使用 Redis List 存储聊天记录（活动队列）
-2. 20秒内两次 user 消息（无 assistant 干隔）自动合并
+2. 400ms内两次 user 消息（无 assistant 干隔）自动合并
 3. 保留最近 N 条消息（可配置）
 4. 格式化历史（去时间戳）供 Prompt 使用
 5. 双队列机制：满阈值时推送到持久化队列，定时任务写入数据库
 6. 持久化队列永久保存，每小时由定时任务批量写入 PostgreSQL
+
+⭐ Stone 迁移：所有 Redis 操作通过 ConversationBufferRepository
 """
 
 import asyncio
 import json
 import time
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Any
 from loguru import logger
 
-import redis.asyncio as aioredis
-
 from app.config import settings
+from app.stone.key_builder import RedisKeyBuilder
 
 
 # 记忆提取配置
@@ -34,10 +35,12 @@ ASSISTANT_MERGE_WINDOW = 0.5   # assistant 消息合并时间窗口（秒）
 
 class ConversationBuffer:
     """Redis 聊天记录缓冲区
-    
+
     双队列架构：
-    - 活动队列（chat_history:{user_id}）：保留最近 N 条消息，供实时对话使用
-    - 持久化队列（memory:buffer:chat:{character_id}:{user_id}）：永久保存，等待定时任务写入数据库
+    - 活动队列（conv:{character_id}:{user_id}）：保留最近 N 条消息，供实时对话使用
+    - 持久化队列（conv:persistent:{character_id}:{user_id}）：永久保存，等待定时任务写入数据库
+
+    ⭐ Stone 迁移：通过 ConversationBufferRepository 操作数据
     """
 
     def __init__(
@@ -46,88 +49,84 @@ class ConversationBuffer:
         character_id: str = "default",
         max_size: int = MAX_HISTORY_SIZE,
         merge_window: float = 2.0,
-        redis_db: int = 2,
         memory_threshold: int = MEMORY_THRESHOLD,
         extraction_batch: int = EXTRACTION_BATCH,
+        stone_repo: Optional[Any] = None,  # ⭐ ConversationBufferRepository
     ):
-        """
+        """初始化
+
         Args:
             user_id: 用户标识
             character_id: 角色标识
             max_size: 最大保留消息数（活动队列）
             merge_window: 合并时间窗口（秒）
-            redis_db: Redis 数据库编号
             memory_threshold: 触发推送到持久化队列的阈值
             extraction_batch: 每次推送的批量大小
-        
-        双队列机制：
-        - 活动队列满阈值时，弹出早期消息到持久化队列
-        - 持久化队列由定时任务每小时批量写入 PostgreSQL
+            stone_repo: Stone ConversationBufferRepository 实例
         """
         self.user_id = user_id
         self.character_id = character_id
         self.max_size = max_size
         self.merge_window = merge_window
-        self.redis_db = redis_db
         self.memory_threshold = memory_threshold
         self.extraction_batch = extraction_batch
-        
+
+        # ⭐ Stone Repository
+        self._stone_repo = stone_repo
+
         # Redis keys
-        self._key = f"chat_history:{user_id}"  # 活动队列
-        self._persistent_key = f"memory:buffer:chat:{character_id}:{user_id}"  # 持久化队列
-        
-        # Redis 连接
-        self._redis: Optional[aioredis.Redis] = None
+        _kb = RedisKeyBuilder()
+        self._key = _kb.conversation(character_id=character_id, user_id=user_id)
+        self._persistent_key = _kb.conversation_persistent(character_id=character_id, user_id=user_id)
+
+        # 连接状态
         self._connected = False
-        
+
         # 回调函数
         self._on_message_updated: Optional[Callable[[], Awaitable[None]]] = None
-        
+
         # 记忆提取回调
         self._memory_extractor: Optional[Callable[[list[dict]], Awaitable[None]]] = None
-        
+
         # Assistant 消息合并状态
-        self._pending_assistant_content: str = ""  # 待确认的 assistant 内容
-        self._pending_assistant_start: Optional[float] = None  # 开始时间
+        self._pending_assistant_content: str = ""
+        self._pending_assistant_start: Optional[float] = None
+
+    async def _get_repo(self):
+        """懒加载 Stone ConversationBufferRepository"""
+        if self._stone_repo is None:
+            from app.stone.repositories.conversation_buffer import get_conversation_buffer_repo
+            self._stone_repo = get_conversation_buffer_repo()
+        return self._stone_repo
+
+    async def _ensure_connected(self) -> None:
+        """确保已连接（Stone 模式下连接由 RedisPool 统一管理）"""
+        if not self._connected:
+            from app.stone import init_redis_pool
+            self._connected = True
+            logger.debug("[ConvBuffer] 已连接(Stone)")
+
+    def set_stone_repo(self, stone_repo: Any) -> None:
+        """设置 Stone ConversationBufferRepository（延迟注入）"""
+        self._stone_repo = stone_repo
+        logger.info("[ConvBuffer] Stone Repository 已设置")
+
+    # === 兼容旧接口 ===
 
     async def connect(self) -> None:
-        """连接 Redis"""
-        if self._connected:
-            return
-            
-        try:
-            # 从 settings 获取 Redis URL
-            redis_url = settings.REDIS_URL
-            # 替换数据库编号
-            if "/0" in redis_url:
-                redis_url = redis_url.replace("/0", f"/{self.redis_db}")
-            elif "/1" in redis_url:
-                redis_url = redis_url.replace("/1", f"/{self.redis_db}")
-            else:
-                redis_url = f"{redis_url}/{self.redis_db}"
-            
-            self._redis = await aioredis.from_url(
-                redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-            )
-            await self._redis.ping()
-            self._connected = True
-            logger.info(f"[ConvBuffer] Redis 已连接: {redis_url}")
-        except Exception as e:
-            logger.error(f"[ConvBuffer] Redis 连接失败: {e}")
-            raise
+        """连接（兼容旧接口，Stone 模式下为 no-op）"""
+        await self._ensure_connected()
 
     async def disconnect(self) -> None:
-        """断开 Redis 连接"""
-        if self._redis:
-            await self._redis.close()
-            self._connected = False
-            logger.info("[ConvBuffer] Redis 已断开")
+        """断开连接（兼容旧接口）"""
+        self._connected = False
+        logger.info("[ConvBuffer] 已断开")
+
+    # === 消息追加 ===
 
     async def append_user_message(self, text: str, timestamp: Optional[float] = None, item_id: Optional[str] = None) -> None:
         """追加用户消息（自动合并）
-        
+
         Args:
             text: 消息文本
             timestamp: 时间戳
@@ -142,46 +141,47 @@ class ConversationBuffer:
         timestamp: Optional[float] = None
     ) -> None:
         """追加 AI 消息（合并到上一条 assistant 消息）
-        
+
         Args:
             text: 消息文本
             inner_monologue: 心理活动内容（将附加在消息中）
             timestamp: 时间戳
-        
+
         逻辑：直接追加到上一条 assistant 消息，不创建新条目
         """
-        if not self._connected:
-            await self.connect()
-            
+        await self._ensure_connected()
+
         if timestamp is None:
             timestamp = time.time()
-            
+
         if not text.strip():
             return
 
+        repo = await self._get_repo()
+
         try:
             # 获取最后一条消息
-            last_msg = await self._redis.lrange(self._key, -1, -1)
-            
+            last_msg = await repo.lrange(self._key, -1, -1)
+
             if last_msg:
                 last_data = json.loads(last_msg[0])
                 last_role = last_data.get("role", "")
-                
+
                 # 如果最后一条是 assistant，直接追加内容
                 if last_role == "assistant":
                     new_content = last_data.get("content", "") + text
                     last_data["content"] = new_content
-                    last_data["ts"] = timestamp  # 更新时间戳
-                    
+                    last_data["ts"] = timestamp
+
                     # 合并心理活动
                     if inner_monologue:
                         existing_monologue = last_data.get("inner_monologue", "")
                         last_data["inner_monologue"] = existing_monologue + inner_monologue
-                    
-                    await self._redis.lset(self._key, -1, json.dumps(last_data, ensure_ascii=False))
+
+                    await repo.lset(self._key, -1, json.dumps(last_data, ensure_ascii=False))
                     logger.debug(f"[ConvBuffer] Assistant 追加: {text[:30]}... (总长度: {len(new_content)})")
                     return
-            
+
             # 如果最后一条不是 assistant，创建新消息
             msg_data = {
                 "ts": timestamp,
@@ -192,11 +192,11 @@ class ConversationBuffer:
             }
             if inner_monologue:
                 msg_data["inner_monologue"] = inner_monologue
-            
-            await self._redis.rpush(self._key, json.dumps(msg_data, ensure_ascii=False))
-            await self._redis.ltrim(self._key, -self.max_size, -1)
+
+            await repo.rpush(self._key, json.dumps(msg_data, ensure_ascii=False))
+            await repo.ltrim(self._key, -self.max_size, -1)
             logger.info(f"[ConvBuffer] Assistant 新消息: {text[:50]}...")
-                
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 追加 assistant 消息失败: {e}")
 
@@ -208,33 +208,34 @@ class ConversationBuffer:
         item_id: Optional[str] = None
     ) -> None:
         """追加消息（基于 item_id 的覆盖逻辑）
-        
+
         核心逻辑：
         1. 如果传入了 item_id，且与最后一条消息的 item_id 相同 → 覆盖（同一句话）
         2. 如果没有 item_id 或 item_id 不同 → 检查时间窗口
            - user → user + 时间差 < 400ms → 覆盖（语音中的短暂停顿）
            - 其他情况 → 创建新消息
         """
-        if not self._connected:
-            await self.connect()
-            
+        await self._ensure_connected()
+
         if timestamp is None:
             timestamp = time.time()
-            
+
         if not text.strip():
             return
 
+        repo = await self._get_repo()
+
         try:
             # 1. 获取最后一条消息
-            last_msg = await self._redis.lrange(self._key, -1, -1)
+            last_msg = await repo.lrange(self._key, -1, -1)
             should_overwrite = False
             overwrite_reason = ""
-            
+
             if last_msg:
                 last_data = json.loads(last_msg[0])
                 last_role = last_data.get("role", "")
                 last_item_id = last_data.get("item_id")
-                
+
                 # 优先使用 item_id 判断（同一句话的中间结果和最终结果）
                 if item_id and last_item_id == item_id:
                     # 同一个 item_id → 同一句话，覆盖
@@ -248,7 +249,7 @@ class ConversationBuffer:
                         overwrite_reason = f"时间覆盖 diff={time_diff*1000:.0f}ms < {USER_MERGE_WINDOW*1000:.0f}ms"
                     else:
                         overwrite_reason = f"超时创建 diff={time_diff*1000:.0f}ms >= {USER_MERGE_WINDOW*1000:.0f}ms"
-            
+
             if should_overwrite:
                 # 覆盖最后一条：更新内容和时间戳
                 merged_data = {
@@ -259,10 +260,10 @@ class ConversationBuffer:
                 # 只有 user 消息保存 item_id
                 if item_id:
                     merged_data["item_id"] = item_id
-                    
-                await self._redis.lset(self._key, -1, json.dumps(merged_data, ensure_ascii=False))
+
+                await repo.lset(self._key, -1, json.dumps(merged_data, ensure_ascii=False))
                 logger.debug(f"[ConvBuffer] 覆盖: {overwrite_reason}, text={text[:30]}...")
-                
+
                 # 触发回调通知 LLM
                 await self._trigger_callback()
             else:
@@ -275,21 +276,21 @@ class ConversationBuffer:
                 # 只有 user 消息保存 item_id
                 if item_id:
                     msg_data["item_id"] = item_id
-                    
-                await self._redis.rpush(self._key, json.dumps(msg_data, ensure_ascii=False))
-                
+
+                await repo.rpush(self._key, json.dumps(msg_data, ensure_ascii=False))
+
                 # 裁剪到最大长度
-                await self._redis.ltrim(self._key, -self.max_size, -1)
-                
+                await repo.ltrim(self._key, -self.max_size, -1)
+
                 logger.info(f"[ConvBuffer] 新消息: role={role}, text={text[:50]}...")
-                
+
                 # 触发回调通知 LLM
                 if role == "user":
                     await self._trigger_callback()
-                
+
                 # 检查是否需要触发记忆提取
                 await self.check_and_extract_memories()
-                
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 追加消息失败: {e}")
 
@@ -305,6 +306,8 @@ class ConversationBuffer:
         """设置消息更新回调"""
         self._on_message_updated = callback
 
+    # === 历史获取 ===
+
     async def get_formatted_history(
         self,
         max_items: Optional[int] = None,
@@ -312,32 +315,28 @@ class ConversationBuffer:
     ) -> str:
         """
         获取格式化历史（去时间戳）
-        
-        ⭐ 优化：直接在 Redis 层限制范围，避免拉取全部数据。
-        
+
         Args:
             max_items: 最大条目数（None = 全部）
             format_style: 格式化风格
-                - "you_me": "你：... me：..." 
+                - "you_me": "你：... me：..."
                 - "user_assistant": "用户：... AI：..."
-        
+
         Returns:
             格式化后的历史文本
         """
-        if not self._connected:
-            await self.connect()
-            
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            # ⭐ 优化：直接在 Redis 层限制范围
             if max_items:
-                # 每条消息可能是 user 或 assistant，取 max_items * 2 条
-                messages = await self._redis.lrange(self._key, -max_items * 2, -1)
+                messages = await repo.lrange(self._key, -max_items * 2, -1)
             else:
-                messages = await self._redis.lrange(self._key, 0, -1)
-            
+                messages = await repo.lrange(self._key, 0, -1)
+
             if not messages:
                 return ""
-            
+
             # 解析并限制条数
             parsed = []
             for msg in messages:
@@ -346,252 +345,218 @@ class ConversationBuffer:
                     parsed.append(data)
                 except json.JSONDecodeError:
                     continue
-            
+
             if max_items:
-                parsed = parsed[-max_items * 2:]  # user + assistant 配对
-            
-            # 格式化
-            # 改为 assistant/user 格式以便区分
+                parsed = parsed[-max_items * 2:]
+
             role_map = {"user": "user", "assistant": "assistant"}
-            
+
             lines = []
             for msg in parsed:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                
                 role_text = role_map.get(role, role)
                 lines.append(f"{role_text}: {content}")
-            
+
             return "\n".join(lines)
-            
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 获取历史失败: {e}")
             return ""
 
     async def get_recent_messages(self, count: int = 10) -> list[dict]:
         """获取最近 N 条消息（带时间戳）"""
-        if not self._connected:
-            await self.connect()
-            
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            messages = await self._redis.lrange(self._key, -count * 2, -1)
-            
+            messages = await repo.lrange(self._key, -count * 2, -1)
+
             parsed = []
             for msg in messages:
                 try:
                     parsed.append(json.loads(msg))
                 except json.JSONDecodeError:
                     continue
-                    
+
             return parsed
-            
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 获取最近消息失败: {e}")
             return []
 
     async def clear(self) -> None:
         """清空历史"""
-        if not self._connected:
-            await self.connect()
-            
+        repo = await self._get_repo()
         try:
-            await self._redis.delete(self._key)
+            await repo.delete(self._key)
             logger.info(f"[ConvBuffer] 已清空历史: {self.user_id}")
         except Exception as e:
             logger.error(f"[ConvBuffer] 清空历史失败: {e}")
 
     async def get_length(self) -> int:
         """获取消息条数"""
-        if not self._connected:
-            await self.connect()
-            
+        repo = await self._get_repo()
         try:
-            return await self._redis.llen(self._key)
+            return await repo.llen(self._key)
         except Exception as e:
             logger.error(f"[ConvBuffer] 获取长度失败: {e}")
             return 0
 
     def set_memory_extractor(self, extractor: Callable[[list[dict]], Awaitable[None]]) -> None:
-        """设置记忆提取回调函数
-        
-        Args:
-            extractor: 异步函数，接收消息列表，提取关键信息
-                      签名: async def extractor(messages: list[dict]) -> None
-        """
+        """设置记忆提取回调函数"""
         self._memory_extractor = extractor
         logger.info(f"[ConvBuffer] 记忆提取器已设置: {self.user_id}")
 
+    # === 持久化队列 ===
+
     async def check_and_push_to_persistent(self) -> None:
         """检查是否需要推送到持久化队列
-        
+
         双队列机制：
         当活动队列消息数量超过阈值时：
         1. 从活动队列左侧弹出最早的 N 条消息
         2. 推送到持久化队列（永久保存）
         3. 持久化队列由定时任务每小时批量写入 PostgreSQL
         """
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            current_length = await self.get_length()
-            
-            # 检查是否超过阈值
+            current_length = await repo.llen(self._key)
+
             if current_length < self.memory_threshold:
                 logger.debug(
                     f"[ConvBuffer] 消息数量 {current_length} < 阈值 {self.memory_threshold}，跳过推送"
                 )
                 return
-            
+
             logger.info(
                 f"[ConvBuffer] 消息数量 {current_length} >= 阈值 {self.memory_threshold}，"
                 f"开始推送 {self.extraction_batch} 条消息到持久化队列"
             )
-            
-            # ⭐ 优化：使用 Redis Pipeline 批量操作，减少网络往返
-            # 原来：最多 100 次串行 Redis 调用（50 lpop + 50 rpush）
-            # 现在：1 次 Pipeline 批量操作
-            async with self._redis.pipeline(transaction=False) as pipe:
-                # 先批量弹出消息
+
+            # 使用原始客户端 pipeline 批量操作（Stone RedisPool 提供）
+            from app.stone import get_redis_pool
+            client = await get_redis_pool().get_client()
+
+            async with client.pipeline(transaction=False) as pipe:
                 pipe.lpop(self._key, self.extraction_batch)
                 results = await pipe.execute()
-            
+
             popped_messages = results[0] if results else []
-            
+
             if popped_messages:
-                # 批量推送到持久化队列
-                async with self._redis.pipeline(transaction=False) as pipe:
+                async with client.pipeline(transaction=False) as pipe:
                     for msg in popped_messages:
                         pipe.rpush(self._persistent_key, msg)
                     await pipe.execute()
-                
+
                 logger.info(
                     f"[ConvBuffer] 已推送 {len(popped_messages)} 条消息到持久化队列: {self._persistent_key}"
                 )
-                
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 推送到持久化队列失败: {e}")
 
     async def get_persistent_queue_length(self) -> int:
         """获取持久化队列消息条数"""
-        if not self._connected:
-            await self.connect()
-            
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            return await self._redis.llen(self._persistent_key)
+            return await repo.llen(self._persistent_key)
         except Exception as e:
             logger.error(f"[ConvBuffer] 获取持久化队列长度失败: {e}")
             return 0
 
     async def get_all_persistent_messages(self) -> list[dict]:
-        """获取持久化队列所有消息（用于定时任务写入数据库）
-        
-        Returns:
-            所有消息列表（解析后的 dict）
-        """
-        if not self._connected:
-            await self.connect()
-            
+        """获取持久化队列所有消息（用于定时任务写入数据库）"""
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            # 获取所有消息
-            all_messages = await self._redis.lrange(self._persistent_key, 0, -1)
-            
+            all_messages = await repo.lrange(self._persistent_key, 0, -1)
+
             if not all_messages:
                 return []
-            
-            # 解析消息
+
             parsed = []
             for msg in all_messages:
                 try:
                     parsed.append(json.loads(msg))
                 except json.JSONDecodeError:
                     continue
-            
+
             return parsed
-            
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 获取持久化队列消息失败: {e}")
             return []
 
     async def clear_persistent_queue(self) -> None:
         """清空持久化队列（写入数据库后调用）"""
-        if not self._connected:
-            await self.connect()
-            
+        repo = await self._get_repo()
         try:
-            await self._redis.delete(self._persistent_key)
+            await repo.delete(self._persistent_key)
             logger.info(f"[ConvBuffer] 已清空持久化队列: {self._persistent_key}")
         except Exception as e:
             logger.error(f"[ConvBuffer] 清空持久化队列失败: {e}")
 
     async def pop_persistent_messages(self, count: int = 100) -> list[dict]:
-        """从持久化队列弹出消息（写入数据库后删除）
-        
-        Args:
-            count: 弹出数量
-        
-        Returns:
-            弹出的消息列表
-        """
-        if not self._connected:
-            await self.connect()
-            
+        """从持久化队列弹出消息（写入数据库后删除）"""
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
             messages = []
             for _ in range(count):
-                msg = await self._redis.lpop(self._persistent_key)
+                msg = await repo.lpop(self._persistent_key)
                 if msg is None:
                     break
                 try:
                     messages.append(json.loads(msg))
                 except json.JSONDecodeError:
                     continue
-            
+
             if messages:
                 logger.info(f"[ConvBuffer] 从持久化队列弹出 {len(messages)} 条消息")
-            
+
             return messages
-            
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 弹出持久化队列消息失败: {e}")
             return []
 
-    # ============ 兼容旧接口 ============
-    
+    # === 兼容旧接口 ===
+
     async def check_and_extract_memories(self) -> None:
-        """检查是否需要触发推送（兼容旧接口名）
-        
-        实际调用 check_and_push_to_persistent
-        """
+        """检查是否需要触发推送（兼容旧接口名）"""
         await self.check_and_push_to_persistent()
 
     async def extract_all_and_clear(self) -> list[dict]:
-        """提取所有消息并清空
-        
-        Returns:
-            所有消息列表
-        """
-        if not self._connected:
-            await self.connect()
-            
+        """提取所有消息并清空"""
+        await self._ensure_connected()
+        repo = await self._get_repo()
+
         try:
-            # 获取所有消息
-            all_messages = await self._redis.lrange(self._key, 0, -1)
-            
+            all_messages = await repo.lrange(self._key, 0, -1)
+
             if not all_messages:
                 return []
-            
-            # 解析消息
+
             parsed = []
             for msg in all_messages:
                 try:
                     parsed.append(json.loads(msg))
                 except json.JSONDecodeError:
                     continue
-            
-            # 清空
-            await self._redis.delete(self._key)
+
+            await repo.delete(self._key)
             logger.info(f"[ConvBuffer] 已提取并清空 {len(parsed)} 条消息: {self.user_id}")
-            
+
             return parsed
-            
+
         except Exception as e:
             logger.error(f"[ConvBuffer] 提取并清空失败: {e}")
             return []
@@ -606,7 +571,7 @@ async def get_conversation_buffer(
     character_id: str = "default",
 ) -> ConversationBuffer:
     """获取或创建 ConversationBuffer 实例
-    
+
     Args:
         user_id: 用户标识
         character_id: 角色标识

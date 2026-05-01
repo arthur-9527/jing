@@ -18,8 +18,8 @@ class PADState:
     D (Dominance) - 支配度  [-1, 1]
     
     ⭐ 统一接口：
-    - PADState.from_baseline(baseline_dict) - 从基线字典创建
-    - PADState(p=0.0, a=0.0, d=0.0) - 直接创建（dataclass 方式）
+    - PADState(baseline={"P": 0.5, "A": 0.0, "D": 0.0}) - 从基线字典创建
+    - PADState(p=0.5, a=0.0, d=0.0) - 直接创建（dataclass 方式）
     """
     p: float = 0.0  # Pleasure
     a: float = 0.0  # Arousal
@@ -27,16 +27,6 @@ class PADState:
     
     # 基线（可选，用于衰减）
     _baseline: dict[str, float] | None = None
-    
-    @classmethod
-    def from_baseline(cls, baseline: dict[str, float]) -> PADState:
-        """从基线字典创建 PADState"""
-        return cls(
-            p=baseline.get("P", 0.0),
-            a=baseline.get("A", 0.0),
-            d=baseline.get("D", 0.0),
-            _baseline=baseline.copy(),
-        )
     
     # ⭐ 兼容旧接口
     def __init__(self, baseline: dict[str, float] | None = None, p: float | None = None, a: float | None = None, d: float | None = None):
@@ -62,46 +52,6 @@ class PADState:
         if self._baseline is None:
             return {"P": self.p, "A": self.a, "D": self.d}
         return self._baseline
-
-    def update(self, delta: dict[str, float]):
-        """
-        指数平滑更新 PAD 值
-        
-        ⭐ 修复数学错误：
-        - 原公式：self.p * 0.8 + (self.p + clamped["P"]) * 0.2
-          展开 = self.p + clamped["P"] * 0.2（权重无效！）
-        - 新公式：self.p * 0.8 + clamped["P"] * 0.2
-          正确的指数平滑
-        
-        - delta 钳制在 ±0.2
-        - 权重：当前 0.8 / 新增 0.2
-        """
-        clamped = {}
-        for k in ("P", "A", "D"):
-            clamped[k] = max(-0.2, min(0.2, delta.get(k, 0.0)))
-
-        # ⭐ 修复后的正确公式
-        self.p = self.p * 0.8 + clamped["P"] * 0.2
-        self.a = self.a * 0.8 + clamped["A"] * 0.2
-        self.d = self.d * 0.8 + clamped["D"] * 0.2
-
-        # 钳制最终值在 [-1, 1]
-        self.p = max(-1.0, min(1.0, self.p))
-        self.a = max(-1.0, min(1.0, self.a))
-        self.d = max(-1.0, min(1.0, self.d))
-
-    def decay(self, rate: float = 0.95):
-        """向基线衰减"""
-        self.p = self.p * rate + self.baseline["P"] * (1 - rate)
-        self.a = self.a * rate + self.baseline["A"] * (1 - rate)
-        self.d = self.d * rate + self.baseline["D"] * (1 - rate)
-
-    def intensity(self, delta: dict[str, float]) -> float:
-        """计算情绪变化的 L2 范数"""
-        dp = delta.get("P", 0.0)
-        da = delta.get("A", 0.0)
-        dd = delta.get("D", 0.0)
-        return (dp ** 2 + da ** 2 + dd ** 2) ** 0.5
 
     def clamp(self) -> PADState:
         """将 PAD 值钳制在 [-1, 1] 范围内"""

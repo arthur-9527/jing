@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
-from app.database import get_db
+from app.stone import get_db_session
 from app.services.search_service import SearchService
 from app.schemas.tag import TagResponse, TagItem
 
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/tags", tags=["tags"])
 @router.get("", response_model=TagResponse)
 async def get_tags(
     tag_type: Optional[str] = Query(default=None),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db_session),
 ):
     """获取标签列表"""
     search_service = SearchService(db)

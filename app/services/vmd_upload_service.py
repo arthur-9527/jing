@@ -2,6 +2,8 @@
 """
 VMD上传服务 - 整合VMD解析、视频分析、数据库存储
 
+使用 Stone 数据层
+
 完全参考 text2vmd 的方式存储：
 - 对缺失帧进行 Bezier 曲线插值
 - 过滤 identity bones
@@ -16,17 +18,16 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, insert, and_
 import asyncio
 from loguru import logger
 
 from app.config import settings
-from app.models.motion import Motion, Keyframe
-from app.models.tag import MotionTag, MotionTagMap
+from app.stone import get_database, get_motion_repo, get_tag_repo
+from app.stone.models.motion import motions, keyframes, motion_tags, motion_tag_map
 from app.services.vmd_parser import VMDParser, VMDData, BoneFrameData
 from app.services.video_analysis_service import VideoAnalysisService, VideoAnalysisResult
-from app.services.embedding_service import EmbeddingService
+from app.agent.memory.embedding import get_embedding
 from app.services.vmd_interpolation_service import vmd_interpolation_service
 
 
@@ -79,7 +80,6 @@ class VMDUploadService:
         self._drafts: Dict[str, VMDUploadDraft] = {}
         self._parser = VMDParser()
         self._video_service = VideoAnalysisService()
-        self._embedding_service = EmbeddingService()
     
     def _ensure_temp_dir(self) -> Path:
         """确保临时目录存在"""
@@ -221,7 +221,7 @@ class VMDUploadService:
     async def confirm(
         self,
         upload_id: str,
-        db: AsyncSession,
+        db: AsyncSession = None,
         display_name: Optional[str] = None,
         tags_override: Optional[List[Dict[str, Any]]] = None,
         is_loopable: bool = False,
@@ -237,7 +237,7 @@ class VMDUploadService:
         
         Args:
             upload_id: 上传ID
-            db: 数据库会话
+            db: 数据库会话（可选，如果不提供则使用 Stone）
             display_name: 显示名称（可选）
             tags_override: 标签覆盖（可选）
             is_loopable: 是否可循环
@@ -262,10 +262,6 @@ class VMDUploadService:
         vmd_parsed = self._parser.parse_bytes(vmd_data)
         
         # 使用插值服务处理 VMD 数据（参考 text2vmd）
-        # 这一步会：
-        # 1. 对缺失帧进行 Bezier 曲线插值
-        # 2. 过滤 identity bones
-        # 3. 返回每帧都有完整骨骼数据的帧字典
         frames_dict, frames_interpolated, bones_filtered = vmd_interpolation_service.process_vmd(vmd_parsed)
         
         logger.info(f"[VMDUpload] 处理完成: 插值帧={frames_interpolated}, 过滤骨骼={bones_filtered}")
@@ -285,77 +281,219 @@ class VMDUploadService:
         
         # 生成embedding
         embed_text = f"{final_name}. {ai_result.description}"
-        embedding = await self._embedding_service.get_embedding(embed_text)
+        embedding = await get_embedding(embed_text)
         
         # 计算实际保存的帧数和时长
         final_frame_count = len(frames_dict)
-        fps = draft.vmd_info["fps"]  # VMD 的原始帧率（通常是 30fps）
+        fps = draft.vmd_info["fps"]
         final_duration = final_frame_count / fps if fps > 0 else 0
         
-        # 创建motion记录
-        motion = Motion(
-            name=draft.vmd_info["name"],
-            display_name=final_name,
-            description=ai_result.description,
-            original_fps=fps,
-            original_frames=final_frame_count,
-            original_duration=final_duration,
-            keyframe_count=final_frame_count,  # 现在每一帧都是关键帧
-            is_loopable=is_loopable,
-            is_interruptible=is_interruptible,
-            status="active",
-            embedding=embedding,
-            source_file=draft.video_path
-        )
+        # 生成 motion_id
+        motion_id = uuid.uuid4()
         
-        db.add(motion)
-        await db.flush()
+        # 准备 motion 数据
+        motion_data = {
+            "id": motion_id,
+            "name": draft.vmd_info["name"],
+            "display_name": final_name,
+            "description": ai_result.description,
+            "original_fps": fps,
+            "original_frames": final_frame_count,
+            "original_duration": final_duration,
+            "keyframe_count": final_frame_count,
+            "is_loopable": is_loopable,
+            "is_interruptible": is_interruptible,
+            "status": "active",
+            "embedding": embedding,
+            "source_file": draft.video_path
+        }
         
-        # 创建关键帧记录 - 按 text2vmd 的格式存储
-        # 每帧都存储完整的骨骼数据
-        keyframes = []
-        for frame_idx in sorted(frames_dict.keys()):
-            bone_data = frames_dict[frame_idx]
+        # 使用外部 session 或 Stone session
+        if db is not None:
+            # 使用外部传入的 session（兼容旧接口）
+            await self._save_with_session(db, motion_data, frames_dict, fps, tags_override, ai_result)
+        else:
+            # 使用 Stone 数据层
+            motion_repo = get_motion_repo()
+            tag_repo = get_tag_repo()
             
-            # 计算时间戳
-            timestamp = frame_idx / fps if fps > 0 else 0
+            # 创建 motion
+            await motion_repo.create(motion_data)
             
-            # 按 text2vmd 的格式存储：{"bone_name": {"trans": [...], "quat": [...]}}
-            # bone_data 已经是这个格式
-            kf = Keyframe(
-                motion_id=motion.id,
-                frame_index=frame_idx,
-                original_frame=frame_idx,
-                timestamp=timestamp,
-                bone_data=bone_data
-            )
-            keyframes.append(kf)
-        
-        if keyframes:
-            db.add_all(keyframes)
-            logger.info(f"[VMDUpload] 保存了 {len(keyframes)} 帧关键帧数据")
-        
-        # 创建标签记录
-        tags_to_use = tags_override if tags_override else (ai_result.tags if ai_result else [])
-        await self._create_tags(db, motion.id, tags_to_use)
-        
-        await db.commit()
+            # 创建关键帧
+            keyframe_data_list = []
+            for frame_idx in sorted(frames_dict.keys()):
+                bone_data = frames_dict[frame_idx]
+                timestamp = frame_idx / fps if fps > 0 else 0
+                keyframe_data_list.append({
+                    "id": uuid.uuid4(),
+                    "motion_id": motion_id,
+                    "frame_index": frame_idx,
+                    "original_frame": frame_idx,
+                    "timestamp": timestamp,
+                    "bone_data": bone_data
+                })
+            
+            if keyframe_data_list:
+                await motion_repo.batch_insert_keyframes(keyframe_data_list)
+                logger.info(f"[VMDUpload] 保存了 {len(keyframe_data_list)} 帧关键帧数据")
+            
+            # 创建标签
+            tags_to_use = tags_override if tags_override else (ai_result.tags if ai_result else [])
+            await self._create_tags_stone(motion_id, tags_to_use)
         
         # 清理草稿
         self._cleanup_draft(upload_id)
         
-        logger.info(f"[VMDUpload] Motion 保存成功: {motion.id}")
+        logger.info(f"[VMDUpload] Motion 保存成功: {motion_id}")
         
         return {
-            "motion_id": str(motion.id),
-            "name": motion.name,
-            "display_name": motion.display_name,
-            "status": motion.status,
-            "tags": tags_to_use,
-            "frames_saved": len(keyframes),
+            "motion_id": str(motion_id),
+            "name": motion_data["name"],
+            "display_name": motion_data["display_name"],
+            "status": motion_data["status"],
+            "tags": tags_override if tags_override else (ai_result.tags if ai_result else []),
+            "frames_saved": len(frames_dict),
             "frames_interpolated": frames_interpolated,
             "bones_filtered": bones_filtered
         }
+    
+    async def _save_with_session(
+        self,
+        db: AsyncSession,
+        motion_data: Dict[str, Any],
+        frames_dict: Dict[int, Any],
+        fps: int,
+        tags_override: Optional[List[Dict[str, Any]]],
+        ai_result: VideoAnalysisResult
+    ):
+        """使用外部 session 保存数据（兼容旧接口）"""
+        motion_id = motion_data["id"]
+        
+        # 创建 motion
+        stmt = insert(motions).values(**motion_data)
+        await db.execute(stmt)
+        
+        # 创建关键帧
+        keyframe_data_list = []
+        for frame_idx in sorted(frames_dict.keys()):
+            bone_data = frames_dict[frame_idx]
+            timestamp = frame_idx / fps if fps > 0 else 0
+            keyframe_data_list.append({
+                "id": uuid.uuid4(),
+                "motion_id": motion_id,
+                "frame_index": frame_idx,
+                "original_frame": frame_idx,
+                "timestamp": timestamp,
+                "bone_data": bone_data
+            })
+        
+        if keyframe_data_list:
+            stmt = insert(keyframes).values(keyframe_data_list)
+            await db.execute(stmt)
+            logger.info(f"[VMDUpload] 保存了 {len(keyframe_data_list)} 帧关键帧数据")
+        
+        # 创建标签
+        tags_to_use = tags_override if tags_override else (ai_result.tags if ai_result else [])
+        await self._create_tags_with_session(db, motion_id, tags_to_use)
+        
+        await db.commit()
+    
+    async def _create_tags_with_session(
+        self,
+        db: AsyncSession,
+        motion_id: uuid.UUID,
+        tags: List[Dict[str, Any]]
+    ):
+        """使用 session 创建或获取标签，并建立关联"""
+        for tag_info in tags:
+            tag_type = tag_info.get("type", "action")
+            tag_name = tag_info.get("name", "")
+            display_name = tag_info.get("display_name", tag_name)
+            weight = tag_info.get("weight", 1.0)
+            
+            if not tag_name:
+                continue
+            
+            # 查找标签
+            stmt = select(motion_tags.c.id, motion_tags.c.embedding).where(
+                and_(
+                    motion_tags.c.tag_type == tag_type,
+                    motion_tags.c.tag_name == tag_name
+                )
+            )
+            result = await db.execute(stmt)
+            row = result.first()
+            
+            if row is None:
+                # 创建新标签
+                tag_embedding = await get_embedding(tag_name)
+                tag_id = uuid.uuid4()
+                stmt = insert(motion_tags).values(
+                    id=tag_id,
+                    tag_type=tag_type,
+                    tag_name=tag_name,
+                    display_name=display_name,
+                    embedding=tag_embedding
+                )
+                await db.execute(stmt)
+            else:
+                tag_id = row[0]
+                # 如果缺少 embedding，补充生成
+                if row[1] is None:
+                    tag_embedding = await get_embedding(tag_name)
+                    stmt = motion_tags.update().where(motion_tags.c.id == tag_id).values(embedding=tag_embedding)
+                    await db.execute(stmt)
+            
+            # 创建关联
+            stmt = insert(motion_tag_map).values(
+                id=uuid.uuid4(),
+                motion_id=motion_id,
+                tag_id=tag_id,
+                weight=weight
+            )
+            await db.execute(stmt)
+    
+    async def _create_tags_stone(
+        self,
+        motion_id: uuid.UUID,
+        tags: List[Dict[str, Any]]
+    ):
+        """使用 Stone 创建或获取标签，并建立关联"""
+        tag_repo = get_tag_repo()
+        motion_repo = get_motion_repo()
+        
+        for tag_info in tags:
+            tag_type = tag_info.get("type", "action")
+            tag_name = tag_info.get("name", "")
+            display_name = tag_info.get("display_name", tag_name)
+            weight = tag_info.get("weight", 1.0)
+            
+            if not tag_name:
+                continue
+            
+            # 查找标签
+            tag = await tag_repo.get_by_name(tag_type, tag_name)
+            
+            if tag is None:
+                # 创建新标签
+                tag_embedding = await get_embedding(tag_name)
+                tag_id = await tag_repo.create({
+                    "id": uuid.uuid4(),
+                    "tag_type": tag_type,
+                    "tag_name": tag_name,
+                    "display_name": display_name,
+                    "embedding": tag_embedding
+                })
+            else:
+                tag_id = tag["id"]
+                # 如果缺少 embedding，补充生成
+                if tag.get("embedding") is None:
+                    tag_embedding = await get_embedding(tag_name)
+                    await tag_repo.update(tag_id, {"embedding": tag_embedding})
+            
+            # 创建关联
+            await motion_repo.add_tag_to_motion(motion_id, tag_id, weight)
     
     def get_draft(self, upload_id: str) -> Optional[Dict[str, Any]]:
         """获取草稿状态"""
@@ -373,7 +511,7 @@ class VMDUploadService:
             "vmd_info": draft.vmd_info,
             "video_info": draft.video_info,
             "ai_result": self._build_ai_result(draft.ai_result) if draft.ai_result else None,
-            "preview_url": None  # TODO: 上传到OSS后返回URL
+            "preview_url": None
         }
     
     def _build_ai_result(self, ai_result: VideoAnalysisResult) -> Dict[str, Any]:
@@ -424,55 +562,6 @@ class VMDUploadService:
         except Exception as e:
             print(f"Video info error: {e}")
             return None
-    
-    async def _create_tags(
-        self,
-        db: AsyncSession,
-        motion_id: str,
-        tags: List[Dict[str, Any]]
-    ):
-        """创建或获取标签，并建立关联（同时生成标签向量）"""
-        for tag_info in tags:
-            tag_type = tag_info.get("type", "action")
-            tag_name = tag_info.get("name", "")
-            display_name = tag_info.get("display_name", tag_name)
-            weight = tag_info.get("weight", 1.0)
-            
-            if not tag_name:
-                continue
-            
-            # 查找或创建标签
-            stmt = select(MotionTag).where(
-                MotionTag.tag_type == tag_type,
-                MotionTag.tag_name == tag_name
-            )
-            result = await db.execute(stmt)
-            tag = result.scalar_one_or_none()
-            
-            if tag is None:
-                # 创建新标签并生成 embedding
-                tag_embedding = await self._embedding_service.get_embedding(tag_name)
-                tag = MotionTag(
-                    tag_type=tag_type,
-                    tag_name=tag_name,
-                    display_name=display_name,
-                    embedding=tag_embedding
-                )
-                db.add(tag)
-                await db.flush()
-            elif tag.embedding is None:
-                # 补生成缺失的 embedding
-                tag_embedding = await self._embedding_service.get_embedding(tag_name)
-                tag.embedding = tag_embedding
-                await db.flush()
-            
-            # 创建关联
-            tag_map = MotionTagMap(
-                motion_id=motion_id,
-                tag_id=tag.id,
-                weight=weight
-            )
-            db.add(tag_map)
     
     def _cleanup_draft(self, upload_id: str):
         """清理草稿文件"""

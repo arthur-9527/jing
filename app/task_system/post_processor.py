@@ -70,17 +70,18 @@ class PostProcessor:
         )
     
     async def _init_cerebras_client(self) -> None:
-        """初始化 Cerebras 客户端"""
+        """初始化 Cerebras 客户端（支持中转端点）"""
         from cerebras.cloud.sdk import Cerebras
         
         api_key = self._settings.POST_PROCESS_API_KEY
-        if not api_key:
-            # 尝试从环境变量获取
-            import os
-            api_key = os.getenv("CEREBRAS_API_KEY") or ""
+        base_url = self._settings.POST_PROCESS_BASE_URL
         
         if api_key:
-            self._cerebras_client = Cerebras(api_key=api_key)
+            client_kwargs = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+                logger.info(f"[PostProcessor] Cerebras 客户端使用中转端点: {base_url}")
+            self._cerebras_client = Cerebras(**client_kwargs)
             logger.info("[PostProcessor] Cerebras 客户端已初始化")
         else:
             logger.warning("[PostProcessor] 未配置 Cerebras API Key，将使用默认行为")
@@ -209,15 +210,17 @@ class PostProcessor:
     
     async def _call_cerebras(self, prompt: str, model: str) -> str:
         """使用 Cerebras SDK 调用"""
+        import asyncio
         if not self._cerebras_client:
             raise RuntimeError("Cerebras 客户端未初始化")
-        
-        response = self._cerebras_client.chat.completions.create(
+
+        response = await asyncio.to_thread(
+            self._cerebras_client.chat.completions.create,
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
-        
+
         content = response.choices[0].message.content
         return content if isinstance(content, str) else str(content)
     

@@ -1,208 +1,205 @@
-"""搜索服务 - 标签搜索和语义搜索"""
+"""搜索服务 - 标签搜索和语义搜索，使用 Stone 数据层"""
 
-from sqlalchemy import select, func, and_, or_, distinct
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-from typing import Optional, List, Dict, Any, Tuple
-from uuid import UUID
+from sqlalchemy import select, func, and_, or_
+from typing import Optional, List, Dict, Any
 
-from app.models.motion import Motion
-from app.models.tag import MotionTag, MotionTagMap
+from app.stone import get_motion_repo, get_tag_repo
+from app.stone.repositories.motion import MotionRepository, TagRepository
+from app.stone.models.motion import motions, motion_tags, motion_tag_map
 from app.schemas.search import TagSearchQuery
 
 
 class SearchService:
-    """搜索服务"""
-    
-    def __init__(self, db: AsyncSession):
-        self.db = db
-    
+    """搜索服务 - 使用 Stone 数据层"""
+
+    def __init__(
+        self,
+        motion_repo: MotionRepository = None,
+        tag_repo: TagRepository = None,
+    ):
+        """初始化
+
+        Args:
+            motion_repo: MotionRepository 实例
+            tag_repo: TagRepository 实例
+        """
+        self._motion_repo = motion_repo or get_motion_repo()
+        self._tag_repo = tag_repo or get_tag_repo()
+
     async def search_by_tags(
         self,
-        query: TagSearchQuery
+        query: TagSearchQuery,
     ) -> List[Dict[str, Any]]:
-        """
-        根据标签搜索动作（支持8个维度）
-        
+        """根据标签搜索动作（支持8个维度）
+
         返回匹配的动作列表，按匹配分数排序
         """
         # 构建标签过滤条件
         tag_filters = []
-        tag_params = {}
-        
+
         if query.emotion:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'emotion', MotionTag.tag_name == query.emotion)
+                and_(motion_tags.c.tag_type == 'emotion', motion_tags.c.tag_name == query.emotion)
             )
-            tag_params['emotion'] = query.emotion
-            
+
         if query.action:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'action', MotionTag.tag_name == query.action)
+                and_(motion_tags.c.tag_type == 'action', motion_tags.c.tag_name == query.action)
             )
-            tag_params['action'] = query.action
-            
+
         if query.scene:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'scene', MotionTag.tag_name == query.scene)
+                and_(motion_tags.c.tag_type == 'scene', motion_tags.c.tag_name == query.scene)
             )
-            tag_params['scene'] = query.scene
-            
+
         if query.intensity:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'intensity', MotionTag.tag_name == query.intensity)
+                and_(motion_tags.c.tag_type == 'intensity', motion_tags.c.tag_name == query.intensity)
             )
-            tag_params['intensity'] = query.intensity
-        
+
         if query.style:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'style', MotionTag.tag_name == query.style)
+                and_(motion_tags.c.tag_type == 'style', motion_tags.c.tag_name == query.style)
             )
-            tag_params['style'] = query.style
-            
+
         if query.speed:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'speed', MotionTag.tag_name == query.speed)
+                and_(motion_tags.c.tag_type == 'speed', motion_tags.c.tag_name == query.speed)
             )
-            tag_params['speed'] = query.speed
-            
+
         if query.rhythm:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'rhythm', MotionTag.tag_name == query.rhythm)
+                and_(motion_tags.c.tag_type == 'rhythm', motion_tags.c.tag_name == query.rhythm)
             )
-            tag_params['rhythm'] = query.rhythm
-            
+
         if query.complexity:
             tag_filters.append(
-                and_(MotionTag.tag_type == 'complexity', MotionTag.tag_name == query.complexity)
+                and_(motion_tags.c.tag_type == 'complexity', motion_tags.c.tag_name == query.complexity)
             )
-            tag_params['complexity'] = query.complexity
-        
+
         if not tag_filters:
             return []
-        
+
+        # 使用 Repository 的内部方法执行复杂查询
         # 查询匹配的动作和分数
         stmt = (
             select(
-                Motion,
-                func.sum(MotionTagMap.weight).label('tag_score')
+                motions,
+                func.sum(motion_tag_map.c.weight).label('tag_score')
             )
-            .join(MotionTagMap, Motion.id == MotionTagMap.motion_id)
-            .join(MotionTag, MotionTagMap.tag_id == MotionTag.id)
+            .select_from(
+                motions.join(motion_tag_map, motions.c.id == motion_tag_map.c.motion_id)
+                .join(motion_tags, motion_tag_map.c.tag_id == motion_tags.c.id)
+            )
             .where(or_(*tag_filters))
-            .group_by(Motion.id)
-            .order_by(func.sum(MotionTagMap.weight).desc())
+            .group_by(motions.c.id)
+            .order_by(func.sum(motion_tag_map.c.weight).desc())
             .limit(query.limit)
         )
-        
-        result = await self.db.execute(stmt)
-        rows = result.all()
 
-        motion_ids = [motion.id for motion, _ in rows]
-        matched_tags_by_motion: dict[UUID, list[str]] = {}
+        rows = await self._motion_repo._mappings(stmt)
 
+        # 获取每个动作匹配的标签
+        motion_ids = [row['id'] for row in rows]
+
+        matched_tags_by_motion: dict = {}
         if motion_ids:
             matched_tags_stmt = (
-                select(MotionTagMap.motion_id, MotionTag.tag_type, MotionTag.tag_name)
-                .join(MotionTag, MotionTagMap.tag_id == MotionTag.id)
+                select(
+                    motion_tag_map.c.motion_id,
+                    motion_tags.c.tag_type,
+                    motion_tags.c.tag_name,
+                )
+                .select_from(
+                    motion_tag_map.join(motion_tags, motion_tag_map.c.tag_id == motion_tags.c.id)
+                )
                 .where(
                     and_(
-                        MotionTagMap.motion_id.in_(motion_ids),
+                        motion_tag_map.c.motion_id.in_(motion_ids),
                         or_(*tag_filters),
                     )
                 )
             )
-            matched_tags_result = await self.db.execute(matched_tags_stmt)
-            for motion_id, tag_type, tag_name in matched_tags_result.all():
-                matched_tags_by_motion.setdefault(motion_id, []).append(f"{tag_type}:{tag_name}")
+            matched_rows = await self._motion_repo._mappings(matched_tags_stmt)
+            for row in matched_rows:
+                motion_id = row['motion_id']
+                matched_tags_by_motion.setdefault(motion_id, []).append(
+                    f"{row['tag_type']}:{row['tag_name']}"
+                )
 
         # 构建结果
         results = []
-        for motion, tag_score in rows:
+        for row in rows:
             results.append({
-                "id": motion.id,
-                "name": motion.name,
-                "display_name": motion.display_name,
-                "original_duration": motion.original_duration,
-                "match_score": float(tag_score),
-                "matched_tags": matched_tags_by_motion.get(motion.id, [])
+                "id": row['id'],
+                "name": row['name'],
+                "display_name": row['display_name'],
+                "original_duration": row['original_duration'],
+                "match_score": float(row['tag_score']),
+                "matched_tags": matched_tags_by_motion.get(row['id'], []),
             })
 
         return results
-    
+
     async def search_semantic(
         self,
         query_embedding: List[float],
-        limit: int = 10
+        limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        """
-        语义搜索动作
-        
+        """语义搜索动作
+
         Args:
             query_embedding: 查询文本的 embedding 向量
             limit: 返回数量限制
-            
+
         Returns:
             按相似度排序的动作列表
         """
         # 使用 pgvector 的余弦相似度搜索
-        # 1 - (embedding <=> query_embedding) 返回相似度 (0-1)
-        # 注意：在 pgvector 0.2.x 中，应使用 Vector 列的 .cosine_distance() 方法
-        
         stmt = (
             select(
-                Motion,
-                (1 - Motion.embedding.cosine_distance(query_embedding)).label('similarity')
+                motions,
+                (1 - motions.c.embedding.cosine_distance(query_embedding)).label('similarity')
             )
-            .where(Motion.embedding.isnot(None))
-            .order_by(Motion.embedding.cosine_distance(query_embedding))
+            .where(motions.c.embedding.isnot(None))
+            .order_by(motions.c.embedding.cosine_distance(query_embedding))
             .limit(limit)
         )
-        
-        result = await self.db.execute(stmt)
-        rows = result.all()
-        
+
+        rows = await self._motion_repo._mappings(stmt)
+
         results = []
-        for motion, similarity in rows:
+        for row in rows:
             results.append({
-                "id": motion.id,
-                "name": motion.name,
-                "display_name": motion.display_name,
-                "original_duration": motion.original_duration,
-                "similarity": float(similarity)
+                "id": row['id'],
+                "name": row['name'],
+                "display_name": row['display_name'],
+                "original_duration": row['original_duration'],
+                "similarity": float(row['similarity']),
             })
-        
+
         return results
-    
+
     async def get_all_tags(
         self,
-        tag_type: Optional[str] = None
+        tag_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        获取所有标签
-        
+        """获取所有标签
+
         Args:
             tag_type: 可选的标签类型过滤
-            
+
         Returns:
             标签列表
         """
-        if tag_type:
-            stmt = select(MotionTag).where(MotionTag.tag_type == tag_type)
-        else:
-            stmt = select(MotionTag)
-        
-        stmt = stmt.order_by(MotionTag.tag_type, MotionTag.tag_name)
-        
-        result = await self.db.execute(stmt)
-        tags = result.scalars().all()
-        
+        tags, _ = await self._tag_repo.get_list(tag_type=tag_type, page_size=1000)
+
         return [
             {
-                "id": tag.id,
-                "tag_type": tag.tag_type,
-                "tag_name": tag.tag_name,
-                "display_name": tag.display_name
+                "id": tag['id'],
+                "tag_type": tag['tag_type'],
+                "tag_name": tag['tag_name'],
+                "display_name": tag['display_name'],
             }
             for tag in tags
         ]

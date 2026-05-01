@@ -1,4 +1,7 @@
-"""Canonical action catalog service."""
+"""Canonical action catalog service.
+
+使用 Stone 数据层
+"""
 
 from __future__ import annotations
 
@@ -6,13 +9,12 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, select, and_
 from sqlalchemy.orm import aliased
 
 from app.agent.memory.embedding import get_embedding
-from app.database import get_db_session
-from app.models.motion import Motion
-from app.models.tag import MotionTag, MotionTagMap
+from app.stone import get_database
+from app.stone.models.motion import motions, motion_tags, motion_tag_map
 
 if TYPE_CHECKING:
     from app.agent.character.loader import CharacterConfig
@@ -155,40 +157,48 @@ class MotionCatalogService:
         await self.initialize()
 
     async def _load_actions(self) -> list[dict[str, Any]]:
-        action_map = aliased(MotionTagMap)
-        action_tag = aliased(MotionTag)
-        system_map = aliased(MotionTagMap)
-        system_tag = aliased(MotionTag)
+        # 使用 Stone Table 定义，不需要 aliased，直接使用表
+        action_map_tbl = motion_tag_map
+        action_tag_tbl = motion_tags
+        system_map_tbl = motion_tag_map
+        system_tag_tbl = motion_tags
 
         system_exists = exists(
             select(1)
-            .select_from(system_map)
-            .join(system_tag, system_map.tag_id == system_tag.id)
+            .select_from(system_map_tbl)
+            .join(system_tag_tbl, system_map_tbl.c.tag_id == system_tag_tbl.c.id)
             .where(
-                system_map.motion_id == Motion.id,
-                system_tag.tag_type == "system",
-                system_tag.tag_name == "others",
+                and_(
+                    system_map_tbl.c.motion_id == motions.c.id,
+                    system_tag_tbl.c.tag_type == "system",
+                    system_tag_tbl.c.tag_name == "others",
+                )
             )
         )
 
         stmt = (
             select(
-                Motion.id.label("motion_id"),
-                Motion.display_name,
-                Motion.description,
-                action_tag.tag_name.label("action_tag"),
-                action_tag.embedding.label("action_embedding"),
+                motions.c.id.label("motion_id"),
+                motions.c.display_name,
+                motions.c.description,
+                action_tag_tbl.c.tag_name.label("action_tag"),
+                action_tag_tbl.c.embedding.label("action_embedding"),
             )
-            .join(action_map, action_map.motion_id == Motion.id)
-            .join(action_tag, action_map.tag_id == action_tag.id)
+            .select_from(
+                motions.join(action_map_tbl, action_map_tbl.c.motion_id == motions.c.id)
+                .join(action_tag_tbl, action_map_tbl.c.tag_id == action_tag_tbl.c.id)
+            )
             .where(
-                Motion.status == "active",
-                action_tag.tag_type == "action",
-                system_exists,
+                and_(
+                    motions.c.status == "active",
+                    action_tag_tbl.c.tag_type == "action",
+                    system_exists,
+                )
             )
         )
 
-        async with get_db_session() as session:
+        db = get_database()
+        async with db.get_session() as session:
             rows = (await session.execute(stmt)).mappings().all()
 
         aggregated: dict[str, dict[str, Any]] = {}

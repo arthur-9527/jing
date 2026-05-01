@@ -94,6 +94,10 @@ class EmotionEvent:
     # 变化量
     delta: PADState = field(default_factory=PADState)
     
+    # ⭐ 心动事件标记（intensity >= 0.5）
+    is_heart_event: bool = False
+    intensity: float = 0.0
+    
     # 触发信息
     trigger_keywords: list[str] = field(default_factory=list)
     inner_monologue: str = ""
@@ -118,6 +122,8 @@ class EmotionEvent:
             "state": self.state.to_dict(),
             "delta": self.delta.to_dict(),
             "dynamics": self.dynamics.to_dict(),
+            "is_heart_event": self.is_heart_event,
+            "intensity": round(self.intensity, 4),
             "trigger_keywords": self.trigger_keywords,
             "inner_monologue": self.inner_monologue,
             "timestamp": self.timestamp.isoformat(),

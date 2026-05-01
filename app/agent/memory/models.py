@@ -24,8 +24,8 @@ class EventType(str, Enum):
     # 经历事件类
     EXPERIENCE = "experience"      # 用户经历的事情
     
-    # 情绪触发类
-    EMOTION_TRIGGER = "emotion_trigger"  # 角色的情绪触发点
+    # 用户倾诉类
+    USER_REVEAL = "user_reveal"      # 用户分享秘密、展示脆弱面、深度倾诉
     
     # 主动记忆类
     INITIATIVE = "initiative"      # 角色主动记录的事
@@ -83,7 +83,7 @@ EVENT_TYPE_DESCRIPTIONS = {
     EventType.FACT: "用户事实（生日、年龄、职业、家庭成员）",
     EventType.SCHEDULE: "日程事件（明天要做什么、重要日期）",
     EventType.EXPERIENCE: "经历事件（今天遇到了什么重要事情）",
-    EventType.EMOTION_TRIGGER: "情绪触发（用户说了什么让角色开心/难过）",
+    EventType.USER_REVEAL: "用户倾诉（分享秘密、展示脆弱面、深度倾诉）",
     EventType.INITIATIVE: "主动记忆（角色认为重要的事情、关系里程碑）",
 }
 

@@ -237,7 +237,7 @@ class TaskSystem:
     async def _init_playback_repo(self) -> None:
         """初始化播报队列连接"""
         try:
-            from app.services.playback.redis_repo import get_playback_repository
+            from app.realtime.playback.redis_repo import get_playback_repository
             self._playback_repo = await get_playback_repository()
             logger.info("[TaskSystem] 播报队列 Redis 已连接")
         except Exception as e:
@@ -247,7 +247,7 @@ class TaskSystem:
     def _mark_init_gate_ready(self) -> None:
         """标记初始化门控就绪"""
         try:
-            from app.services.init_gate import get_init_gate
+            from app.realtime.init_gate import get_init_gate
             get_init_gate().mark_ready("task_system")
             logger.info("[TaskSystem] 门控已标记就绪")
         except Exception as e:
@@ -487,6 +487,17 @@ class TaskSystem:
                 action=None,
             )
         
+        # ⭐ 从 task context 获取渠道信息并注入到 broadcast
+        context = task.context or {}
+        if context.get("source_channel"):
+            broadcast.source_channel = context.get("source_channel", "realtime")
+            broadcast.channel_id = context.get("channel_id")
+            broadcast.user_id = context.get("user_id")
+            logger.info(
+                f"[TaskSystem] 渠道信息已注入: source={broadcast.source_channel}, "
+                f"channel={broadcast.channel_id}, user={broadcast.user_id}"
+            )
+        
         # Step 4: 存储播报内容
         await self._repository.update_broadcast_content(task_id, broadcast.to_dict())
         
@@ -504,13 +515,21 @@ class TaskSystem:
         )
     
     async def _enqueue_broadcast(self, broadcast: BroadcastContent) -> None:
-        """入播报队列
+        """入播报队列 - 支持多渠道分发
         
-        将播报内容推送到 PlaybackScheduler 的 Redis 队列
+        根据 source_channel 决定分发路径：
+        - realtime: 入 PlaybackScheduler Redis 队列（原有逻辑）
+        - im: 通过 ChannelManager 推送到 IM 用户
         """
+        # ⭐ IM 渠道：通过 ChannelManager 推送
+        if broadcast.source_channel == "im":
+            await self._enqueue_broadcast_to_im(broadcast)
+            return
+        
+        # ⭐ 实时流渠道：入 PlaybackScheduler 队列（原有逻辑）
         if self._playback_repo:
             try:
-                from app.services.playback.models import PlaybackTask
+                from app.realtime.playback.models import PlaybackTask
                 
                 # ⭐ 创建 PlaybackTask 对象
                 task = PlaybackTask(
@@ -529,6 +548,58 @@ class TaskSystem:
                 logger.error(f"[TaskSystem] 播报入队失败: {e}")
         else:
             logger.warning("[TaskSystem] 播报队列未初始化，无法入队")
+    
+    async def _enqueue_broadcast_to_im(self, broadcast: BroadcastContent) -> None:
+        """IM 渠道播报推送
+        
+        通过 ChannelManager 将工具调用结果推送到 IM 用户
+        
+        Args:
+            broadcast: 播报内容（包含 channel_id 和 user_id）
+        """
+        if not broadcast.channel_id or not broadcast.user_id:
+            logger.warning(
+                f"[TaskSystem] IM 播报缺少 channel_id 或 user_id: "
+                f"task_id={broadcast.task_id[:8]}"
+            )
+            return
+        
+        try:
+            from app.channel.manager import get_channel_manager
+            from app.channel.types import OutboundMessage
+            
+            manager = get_channel_manager()
+            
+            # ⭐ 构建 IM OutboundMessage（纯文本，无 panel）
+            outbound = OutboundMessage(
+                channel_id=broadcast.channel_id,
+                user_id=broadcast.user_id,
+            ).add_text(broadcast.content)
+            
+            # 推送到 IM Channel
+            success = await manager.send_to_user(
+                user_id=broadcast.user_id,
+                content=outbound,
+                channel_id=broadcast.channel_id,
+            )
+            
+            if success:
+                logger.info(
+                    f"[TaskSystem] IM 播报已推送: task_id={broadcast.task_id[:8]}, "
+                    f"channel={broadcast.channel_id}, user={broadcast.user_id}, "
+                    f"content={broadcast.content[:30]}..."
+                )
+            else:
+                logger.warning(
+                    f"[TaskSystem] IM 播报推送失败: task_id={broadcast.task_id[:8]}, "
+                    f"channel={broadcast.channel_id}, user={broadcast.user_id}"
+                )
+                
+        except Exception as e:
+            logger.error(
+                f"[TaskSystem] IM 播报推送异常: task_id={broadcast.task_id[:8]}, "
+                f"error={e}"
+            )
     
     # ===== Provider 注册 =====
     

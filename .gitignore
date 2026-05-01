@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # Environments
+models/
 .venv/
 venv/
 ENV/
@@ -25,10 +26,18 @@ htmlcov/
 
 # Logs
 *.log
+logs/
+test.log
+botpy.log
 
 # Build / Distribution
+dist/
 build/
 *.egg-info/
 
 # Documentation
 docs/
+temp/
+
+# Chat Test 模块（独立测试模块，不上传）
+chat_test/

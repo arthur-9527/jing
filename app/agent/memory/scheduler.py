@@ -18,12 +18,10 @@ from loguru import logger
 
 from app.config import settings
 from app.services.chat_history.conversation_buffer import get_conversation_buffer
-from app.agent.db.memory_models import (
-    batch_insert_chat_messages,
-    batch_insert_key_events,
-    batch_insert_heartbeat_events,
-    mark_messages_extracted,
-    cleanup_old_chat_messages,
+from app.stone import (
+    get_agent_state_repo,
+    get_chat_repo,
+    get_key_event_repo,
 )
 from app.agent.memory.extractor import get_memory_extractor
 from app.agent.memory.generator import get_memory_generator
@@ -122,72 +120,160 @@ class MemoryScheduler:
         """定时任务：从 Redis 持久化队列写入 PostgreSQL + 事件提取
         
         流程：
-        1. 从 Redis 持久化队列获取所有消息
-        2. 批量写入 PostgreSQL chat_messages 表
+        1. 从 Redis 扫描所有用户的持久化队列（多用户支持）
+        2. 遍历每个队列，批量写入 PostgreSQL chat_messages 表
         3. LLM 提取关键事件 + 心动事件
         4. 写入 key_events / heartbeat_events 表
         5. 标记消息已提取
         6. 清空持久化队列
+        
+        ⭐ 支持多用户：动态扫描所有 memory:buffer:chat:* 队列
         """
         logger.info("[MemoryScheduler] 开始执行持久化队列写入任务...")
 
         try:
-            # 获取所有用户的持久化队列
-            # 目前只有一个默认用户，后续可扩展为多用户
-            character_id = getattr(settings, 'CHARACTER_ID', 'daji')
-            user_id = "default_user"
+            # ⭐ 动态扫描所有用户的持久化队列
+            all_queues = await self._scan_all_persistent_queues()
             
-            buffer = await get_conversation_buffer(
-                user_id=user_id,
-                character_id=character_id,
-            )
-
-            # 获取持久化队列中的消息
-            messages = await buffer.get_all_persistent_messages()
-
-            if not messages:
-                logger.info("[MemoryScheduler] 持久化队列为空，跳过写入")
+            if not all_queues:
+                logger.info("[MemoryScheduler] 没有持久化队列，跳过写入")
                 return
-
-            logger.info(f"[MemoryScheduler] 持久化队列有 {len(messages)} 条消息待写入")
-
-            # 转换消息格式为数据库格式
-            db_messages = []
-            for msg in messages:
-                db_msg = {
-                    "character_id": msg.get("character_id", character_id),
-                    "user_id": msg.get("user_id", user_id),
-                    "role": msg.get("role", "user"),
-                    "content": msg.get("content", ""),
-                    "inner_monologue": msg.get("inner_monologue"),
-                    "turn_id": msg.get("turn_id"),
-                    "metadata": {
-                        "ts": msg.get("ts"),
-                        "item_id": msg.get("item_id"),
-                    },
-                }
-                db_messages.append(db_msg)
-
-            # Step 1-2: 批量写入数据库
-            record_ids = await batch_insert_chat_messages(db_messages)
-            logger.info(f"[MemoryScheduler] 成功写入 {len(record_ids)} 条消息到 chat_messages")
-
-            # Step 3-5: 事件提取（如果有消息写入成功）
-            if record_ids:
-                await self._extract_events_from_messages(
-                    messages=messages,
-                    record_ids=record_ids,
-                    character_id=character_id,
-                    user_id=user_id,
-                )
-
-            # Step 6: 清空持久化队列
-            await buffer.clear_persistent_queue()
-
-            logger.info("[MemoryScheduler] 持久化队列写入任务完成")
+            
+            logger.info(f"[MemoryScheduler] 发现 {len(all_queues)} 个持久化队列待处理")
+            
+            total_written = 0
+            
+            # 遍历每个队列执行写入
+            for queue_info in all_queues:
+                character_id = queue_info["character_id"]
+                user_id = queue_info["user_id"]
+                queue_key = queue_info["queue_key"]
+                
+                try:
+                    written_count = await self._flush_single_queue(
+                        character_id=character_id,
+                        user_id=user_id,
+                    )
+                    total_written += written_count
+                    
+                except Exception as e:
+                    logger.error(f"[MemoryScheduler] 队列 {queue_key} 写入失败: {e}")
+                    continue
+            
+            logger.info(f"[MemoryScheduler] 持久化队列写入任务完成，总共写入 {total_written} 条消息")
 
         except Exception as e:
             logger.error(f"[MemoryScheduler] 持久化队列写入任务失败: {e}")
+    
+    async def _scan_all_persistent_queues(self) -> list[dict]:
+        """扫描 Redis 中所有用户的持久化队列
+        
+        Returns:
+            队列信息列表：[{"character_id", "user_id", "queue_key", "length"}, ...]
+        """
+        try:
+            from app.stone import get_redis_pool
+            from app.stone.key_builder import RedisKeyBuilder
+            redis_client = await get_redis_pool().get_client()
+
+            # 扫描所有持久化队列（使用 Stone Key 模式）
+            _kb = RedisKeyBuilder()
+            pattern = _kb.build("conversation_persistent", channel="*", user_id="*")
+            queues = []
+            
+            async for key in redis_client.scan_iter(match=pattern):
+                # 解析 key: agent:conv:persistent:{character_id}:{user_id}
+                # parts: ["agent", "conv", "persistent", "{character_id}", "{user_id}"]
+                parts = key.split(":")
+                if len(parts) >= 5:
+                    character_id = parts[3]
+                    user_id = parts[4]
+                    
+                    # 获取队列长度
+                    length = await redis_client.llen(key)
+                    
+                    if length > 0:
+                        queues.append({
+                            "character_id": character_id,
+                            "user_id": user_id,
+                            "queue_key": key,
+                            "length": length,
+                        })
+                        logger.debug(f"[MemoryScheduler] 发现队列: {key}, 消息数: {length}")
+            
+            
+            # 按消息数排序，优先处理大队列
+            queues.sort(key=lambda x: x["length"], reverse=True)
+            
+            return queues
+            
+        except Exception as e:
+            logger.error(f"[MemoryScheduler] 扫描持久化队列失败: {e}")
+            return []
+    
+    async def _flush_single_queue(
+        self,
+        character_id: str,
+        user_id: str,
+    ) -> int:
+        """处理单个用户的持久化队列
+        
+        Args:
+            character_id: 角色ID
+            user_id: 用户ID
+        
+        Returns:
+            写入的消息条数
+        """
+        buffer = await get_conversation_buffer(
+            user_id=user_id,
+            character_id=character_id,
+        )
+
+        # 获取持久化队列中的消息
+        messages = await buffer.get_all_persistent_messages()
+
+        if not messages:
+            logger.info(f"[MemoryScheduler] 队列 {character_id}:{user_id} 为空，跳过")
+            return 0
+
+        logger.info(f"[MemoryScheduler] 队列 {character_id}:{user_id} 有 {len(messages)} 条消息待写入")
+
+        # 转换消息格式为数据库格式（使用消息本身的 character_id/user_id）
+        db_messages = []
+        for msg in messages:
+            db_msg = {
+                "character_id": msg.get("character_id", character_id),
+                "user_id": msg.get("user_id", user_id),
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", ""),
+                "inner_monologue": msg.get("inner_monologue"),
+                "turn_id": msg.get("turn_id"),
+                "metadata": {
+                    "ts": msg.get("ts"),
+                    "item_id": msg.get("item_id"),
+                },
+            }
+            db_messages.append(db_msg)
+
+        # 使用 Stone Repository 批量写入
+        chat_repo = get_chat_repo()
+        record_ids = await chat_repo.batch_insert(db_messages)
+        logger.info(f"[MemoryScheduler] 成功写入 {len(record_ids)} 条消息到 chat_messages ({character_id}:{user_id})")
+
+        # 事件提取（如果有消息写入成功）
+        if record_ids:
+            await self._extract_events_from_messages(
+                messages=messages,
+                record_ids=record_ids,
+                character_id=character_id,
+                user_id=user_id,
+            )
+
+        # 清空持久化队列
+        await buffer.clear_persistent_queue()
+
+        return len(record_ids)
 
     async def _extract_events_from_messages(
         self,
@@ -196,7 +282,7 @@ class MemoryScheduler:
         character_id: str,
         user_id: str,
     ) -> None:
-        """从消息中提取事件
+        """从消息中提取关键事件
         
         Args:
             messages: 原始消息列表
@@ -210,8 +296,8 @@ class MemoryScheduler:
             # 获取提取器
             extractor = get_memory_extractor()
             
-            # 并行提取关键事件和心动事件
-            key_events, heartbeat_events = await extractor.extract_all(
+            # 提取关键事件
+            key_events = await extractor.extract_key_events(
                 messages=messages,
                 character_id=character_id,
                 user_id=user_id,
@@ -220,161 +306,367 @@ class MemoryScheduler:
             
             # 写入关键事件
             if key_events:
-                key_event_ids = await batch_insert_key_events(key_events)
+                key_event_repo = get_key_event_repo()
+                key_event_ids = await key_event_repo.batch_insert(key_events)
                 logger.info(f"[MemoryScheduler] 写入 {len(key_event_ids)} 条关键事件")
             
-            # 写入心动事件
-            if heartbeat_events:
-                heartbeat_ids = await batch_insert_heartbeat_events(heartbeat_events)
-                logger.info(f"[MemoryScheduler] 写入 {len(heartbeat_ids)} 条心动事件")
-            
             # 标记消息已提取
-            marked_count = await mark_messages_extracted(record_ids)
+            chat_repo = get_chat_repo()
+            marked_count = await chat_repo.mark_extracted(record_ids)
             logger.info(f"[MemoryScheduler] 标记 {marked_count} 条消息已提取")
             
         except Exception as e:
             logger.error(f"[MemoryScheduler] 事件提取失败: {e}")
 
     async def _job_generate_daily_diary(self) -> None:
-        """定时任务：每天凌晨2点生成日记"""
+        """定时任务：每天凌晨2点生成日记（遍历所有用户）
+
+        ⭐ 多用户：遍历所有活跃的 (character_id, user_id) 组合
+        ⭐ 新增：日记生成后执行理性好感度评估 + 结算
+        """
         logger.info("[MemoryScheduler] 开始执行日记生成任务...")
 
         try:
-            character_id = getattr(settings, 'CHARACTER_ID', 'daji')
-            user_id = "default_user"
-
-            generator = get_memory_generator()
-            
-            # 生成昨天的日记
             from datetime import date, timedelta
             yesterday = date.today() - timedelta(days=1)
-            
-            diary_id = await generator.generate_daily_diary(
-                character_id=character_id,
-                user_id=user_id,
-                diary_date=yesterday,
-            )
-            
-            if diary_id:
-                logger.info(f"[MemoryScheduler] 日记生成成功: id={diary_id}, date={yesterday}")
-            else:
-                logger.info(f"[MemoryScheduler] 日记生成跳过: date={yesterday} (无数据)")
+
+            agent_state_repo = get_agent_state_repo()
+            active_users = await agent_state_repo.get_all_active_users()
+            if not active_users:
+                logger.info("[MemoryScheduler] 无活跃用户，跳过日记生成")
+                return
+
+            logger.info(f"[MemoryScheduler] 发现 {len(active_users)} 个活跃用户，开始生成日记")
+            generator = get_memory_generator()
+
+            for user_info in active_users:
+                character_id = user_info["character_id"]
+                user_id = user_info["user_id"]
+
+                try:
+                    diary_id = await generator.generate_daily_diary(
+                        character_id=character_id,
+                        user_id=user_id,
+                        target_date=yesterday,
+                    )
+
+                    if diary_id:
+                        logger.info(f"[MemoryScheduler] 日记生成成功: {character_id}:{user_id}, id={diary_id}, date={yesterday}")
+                        await self._settle_affection_on_diary(
+                            character_id=character_id,
+                            user_id=user_id,
+                            diary_id=diary_id,
+                            diary_date=yesterday,
+                        )
+                    else:
+                        logger.info(f"[MemoryScheduler] 日记生成跳过: {character_id}:{user_id} (无数据)")
+
+                except Exception as e:
+                    logger.error(f"[MemoryScheduler] 用户 {character_id}:{user_id} 日记生成失败: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"[MemoryScheduler] 日记生成任务失败: {e}")
-
-    async def _job_generate_weekly_index(self) -> None:
-        """定时任务：每周日凌晨3点生成周索引 + 清理旧聊天记录
+    
+    async def _settle_affection_on_diary(
+        self,
+        character_id: str,
+        user_id: str,
+        diary_id: str,
+        diary_date: "date",
+    ) -> None:
+        """日记生成后执行理性好感度评估 + 结算
         
         流程：
-        1. 生成上周的周索引
-        2. 清理上上周的聊天记录（保留14天）
+        1. 获取日记内容（用于理性评估）
+        2. 获取好感度服务
+        3. 构建理性评估 prompt（带人设）
+        4. LLM 评估理性增量
+        5. 执行 settle_on_diary（感性总结 + 理性增量 → 更新 base）
         
-        清理逻辑：
-        - 比如：生成第2周(8-14)的周索引后，删除第-1周(14天前)的聊天记录
-        - 保证聊天记录最多保留14天
+        Args:
+            character_id: 角色 ID
+            user_id: 用户 ID
+            diary_id: 日记 ID
+            diary_date: 日记日期
+        """
+        try:
+            # 1. 获取日记内容（get_daily_diary 返回单个 dict 或 None）
+            from app.agent.memory.retriever import get_daily_diary
+
+            diary_row = await get_daily_diary(character_id, user_id, diary_date)
+            if not diary_row:
+                logger.info("[MemoryScheduler] 无日记内容，跳过好感度结算")
+                return
+
+            diary_content = diary_row.get("summary", "") or diary_row.get("content", "")
+
+            if not diary_content.strip():
+                logger.info("[MemoryScheduler] 日记内容为空，跳过好感度结算")
+                return
+
+            logger.info(f"[MemoryScheduler] 日记内容长度: {len(diary_content)} chars")
+            
+            # 2. 获取好感度服务
+            from app.services.affection import get_affection_service
+            affection_service = await get_affection_service()
+            
+            # 3. 获取角色人设（用于理性评估）
+            personality_text = await self._load_personality_text(character_id)
+            
+            # 4. 构建理性评估 prompt 并调用 LLM
+            from app.services.affection.prompts import build_rational_assessment_prompt
+            from app.services.affection.models import AffectionAssessment
+            from app.agent.llm.client import LLMClient
+            
+            # 获取当前好感度状态
+            from app.services.affection.models import AffectionDimension
+            affection_state = await affection_service.get_state(character_id, user_id)
+
+            # 计算各维度感性总结（使用 AffectionService 共享方法）
+            emotional_summaries = affection_service.compute_emotional_summaries(affection_state)
+
+            # 构建理性评估 prompt
+            rational_prompt = build_rational_assessment_prompt(
+                affection_state=affection_state,
+                emotional_summaries=emotional_summaries,
+                diary_content=diary_content,
+                personality_text=personality_text,
+            )
+            
+            # 调用 LLM
+            llm = LLMClient()
+            response = await llm.chat(
+                [{"role": "user", "content": rational_prompt}],
+                temperature=0.3,
+            )
+            
+            # 解析评估结果
+            import json
+            try:
+                assessment_dict = json.loads(response.strip())
+                rational_assessment = AffectionAssessment.from_dict(assessment_dict)
+                logger.info(
+                    "[MemoryScheduler] 理性好感度评估: trust={:.2f}, intimacy={:.2f}, respect={:.2f}",
+                    rational_assessment.trust_delta,
+                    rational_assessment.intimacy_delta,
+                    rational_assessment.respect_delta,
+                )
+            except json.JSONDecodeError:
+                logger.warning("[MemoryScheduler] 理性评估结果解析失败，使用默认值")
+                rational_assessment = AffectionAssessment()
+            
+            # 5. 执行结算（感性总结 + 理性增量 → 更新 base）
+            result = await affection_service.settle_on_diary(
+                character_id=character_id,
+                user_id=user_id,
+                diary_rational_delta=rational_assessment,
+            )
+            
+            logger.info(
+                "[MemoryScheduler] 好感度结算完成: emotional={}, rational={}, new_bases={}",
+                result.get("emotional_summaries"),
+                result.get("rational_deltas"),
+                result.get("new_bases"),
+            )
+            
+        except Exception as e:
+            logger.error(f"[MemoryScheduler] 好感度结算失败: {e}")
+    
+    async def _load_personality_text(self, character_id: str) -> str:
+        """加载角色人设文本
+        
+        Args:
+            character_id: 角色 ID
+            
+        Returns:
+            人设文本（用于理性评估）
+        """
+        try:
+            import os
+            from app.config import settings
+            
+            # 获取角色配置路径
+            config_path = getattr(settings, 'CHARACTER_CONFIG_PATH', 'config/characters/daji')
+            
+            # 解析路径
+            if config_path.endswith('.json'):
+                character_dir = config_path.replace('.json', '')
+            else:
+                character_dir = config_path
+            
+            # 构建 personality.md 路径
+            if os.path.isabs(character_dir):
+                personality_path = os.path.join(character_dir, 'personality.md')
+            else:
+                personality_path = os.path.join(os.getcwd(), character_dir, 'personality.md')
+            
+            if os.path.exists(personality_path):
+                with open(personality_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 提取性格特点部分
+                personality_text = ""
+                sections = content.split('##')
+                for section in sections:
+                    section_lower = section.lower()
+                    if '性格' in section_lower or '人设' in section_lower:
+                        personality_text = section.strip()
+                        break
+                
+                return personality_text
+            else:
+                logger.warning(f"[MemoryScheduler] personality.md 不存在: {personality_path}")
+                return ""
+                
+        except Exception as e:
+            logger.warning(f"[MemoryScheduler] 加载人设失败: {e}")
+            return ""
+
+    async def _job_generate_weekly_index(self) -> None:
+        """定时任务：每周日凌晨3点生成周索引 + 清理旧聊天记录（遍历所有用户）
+
+        ⭐ 多用户：遍历所有活跃的 (character_id, user_id) 组合
         """
         logger.info("[MemoryScheduler] 开始执行周索引生成任务...")
 
         try:
-            character_id = getattr(settings, 'CHARACTER_ID', 'daji')
-            user_id = "default_user"
-
-            generator = get_memory_generator()
-            
-            # 生成上周的周索引
             from datetime import date, timedelta
             today = date.today()
-            # 上周的周一到周日
-            week_start = today - timedelta(days=today.weekday() + 7)  # 上周一
-            week_end = week_start + timedelta(days=6)  # 上周日
-            
-            weekly_id = await generator.generate_weekly_index(
-                character_id=character_id,
-                user_id=user_id,
-                week_start=week_start,
-                week_end=week_end,
-            )
-            
-            if weekly_id:
-                logger.info(f"[MemoryScheduler] 周索引生成成功: id={weekly_id}, week={week_start}~{week_end}")
-            else:
-                logger.info(f"[MemoryScheduler] 周索引生成跳过: week={week_start}~{week_end} (无日记)")
+            week_start = today - timedelta(days=today.weekday() + 7)
+            week_end = week_start + timedelta(days=6)
 
-            # Step 2: 清理上上周的聊天记录（14天前的）
-            # 删除14天前未提取的聊天记录（已提取的保留在事件/日记中）
-            deleted_count = await cleanup_old_chat_messages(
-                character_id=character_id,
-                user_id=user_id,
-                days=14,
-            )
-            
-            if deleted_count > 0:
-                logger.info(f"[MemoryScheduler] 清理完成: 删除 {deleted_count} 条14天前的聊天记录")
+            agent_state_repo = get_agent_state_repo()
+            active_users = await agent_state_repo.get_all_active_users()
+            if not active_users:
+                logger.info("[MemoryScheduler] 无活跃用户，跳过周索引生成")
+                return
+
+            logger.info(f"[MemoryScheduler] 发现 {len(active_users)} 个活跃用户，开始生成周索引")
+            generator = get_memory_generator()
+
+            for user_info in active_users:
+                character_id = user_info["character_id"]
+                user_id = user_info["user_id"]
+
+                try:
+                    weekly_id = await generator.generate_weekly_index(
+                        character_id=character_id,
+                        user_id=user_id,
+                        week_start=week_start,
+                    )
+
+                    if weekly_id:
+                        logger.info(f"[MemoryScheduler] 周索引生成成功: {character_id}:{user_id}, id={weekly_id}, week={week_start}~{week_end}")
+                    else:
+                        logger.info(f"[MemoryScheduler] 周索引生成跳过: {character_id}:{user_id} (无日记)")
+
+                    # 使用 Stone Repository 清理旧消息
+                    chat_repo = get_chat_repo()
+                    deleted_count = await chat_repo.cleanup(
+                        character_id=character_id,
+                        user_id=user_id,
+                        days=14,
+                    )
+                    if deleted_count > 0:
+                        logger.info(f"[MemoryScheduler] 清理完成: {character_id}:{user_id} 删除 {deleted_count} 条14天前的聊天记录")
+
+                except Exception as e:
+                    logger.error(f"[MemoryScheduler] 用户 {character_id}:{user_id} 周索引生成失败: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"[MemoryScheduler] 周索引生成任务失败: {e}")
 
     async def _job_generate_monthly_index(self) -> None:
-        """定时任务：每月28号凌晨4点生成月索引"""
+        """定时任务：每月28号凌晨4点生成月索引（遍历所有用户）
+
+        ⭐ 多用户：遍历所有活跃的 (character_id, user_id) 组合
+        """
         logger.info("[MemoryScheduler] 开始执行月索引生成任务...")
 
         try:
-            character_id = getattr(settings, 'CHARACTER_ID', 'daji')
-            user_id = "default_user"
-
-            generator = get_memory_generator()
-            
-            # 生成上个月的月索引
             from datetime import date, timedelta
             today = date.today()
-            # 上个月的年份和月份
             if today.month == 1:
                 year = today.year - 1
                 month = 12
             else:
                 year = today.year
                 month = today.month - 1
-            
-            monthly_id = await generator.generate_monthly_index(
-                character_id=character_id,
-                user_id=user_id,
-                year=year,
-                month=month,
-            )
-            
-            if monthly_id:
-                logger.info(f"[MemoryScheduler] 月索引生成成功: id={monthly_id}, {year}-{month}")
-            else:
-                logger.info(f"[MemoryScheduler] 月索引生成跳过: {year}-{month} (无周索引)")
+
+            agent_state_repo = get_agent_state_repo()
+            active_users = await agent_state_repo.get_all_active_users()
+            if not active_users:
+                logger.info("[MemoryScheduler] 无活跃用户，跳过月索引生成")
+                return
+
+            logger.info(f"[MemoryScheduler] 发现 {len(active_users)} 个活跃用户，开始生成月索引")
+            generator = get_memory_generator()
+
+            for user_info in active_users:
+                character_id = user_info["character_id"]
+                user_id = user_info["user_id"]
+
+                try:
+                    monthly_id = await generator.generate_monthly_index(
+                        character_id=character_id,
+                        user_id=user_id,
+                        year=year,
+                        month=month,
+                    )
+
+                    if monthly_id:
+                        logger.info(f"[MemoryScheduler] 月索引生成成功: {character_id}:{user_id}, id={monthly_id}, {year}-{month}")
+                    else:
+                        logger.info(f"[MemoryScheduler] 月索引生成跳过: {character_id}:{user_id}, {year}-{month} (无周索引)")
+
+                except Exception as e:
+                    logger.error(f"[MemoryScheduler] 用户 {character_id}:{user_id} 月索引生成失败: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"[MemoryScheduler] 月索引生成任务失败: {e}")
 
     async def _job_generate_annual_index(self) -> None:
-        """定时任务：每年12月31日凌晨5点生成年索引"""
+        """定时任务：每年12月31日凌晨5点生成年索引（遍历所有用户）
+
+        ⭐ 多用户：遍历所有活跃的 (character_id, user_id) 组合
+        """
         logger.info("[MemoryScheduler] 开始执行年索引生成任务...")
 
         try:
-            character_id = getattr(settings, 'CHARACTER_ID', 'daji')
-            user_id = "default_user"
-
-            generator = get_memory_generator()
-            
-            # 生成今年的年索引（年末总结）
             from datetime import date
             year = date.today().year
-            
-            annual_id = await generator.generate_annual_index(
-                character_id=character_id,
-                user_id=user_id,
-                year=year,
-            )
-            
-            if annual_id:
-                logger.info(f"[MemoryScheduler] 年索引生成成功: id={annual_id}, year={year}")
-            else:
-                logger.info(f"[MemoryScheduler] 年索引生成跳过: year={year} (无月索引)")
+
+            agent_state_repo = get_agent_state_repo()
+            active_users = await agent_state_repo.get_all_active_users()
+            if not active_users:
+                logger.info("[MemoryScheduler] 无活跃用户，跳过年索引生成")
+                return
+
+            logger.info(f"[MemoryScheduler] 发现 {len(active_users)} 个活跃用户，开始生成年索引")
+            generator = get_memory_generator()
+
+            for user_info in active_users:
+                character_id = user_info["character_id"]
+                user_id = user_info["user_id"]
+
+                try:
+                    annual_id = await generator.generate_annual_index(
+                        character_id=character_id,
+                        user_id=user_id,
+                        year=year,
+                    )
+
+                    if annual_id:
+                        logger.info(f"[MemoryScheduler] 年索引生成成功: {character_id}:{user_id}, id={annual_id}, year={year}")
+                    else:
+                        logger.info(f"[MemoryScheduler] 年索引生成跳过: {character_id}:{user_id}, year={year} (无月索引)")
+
+                except Exception as e:
+                    logger.error(f"[MemoryScheduler] 用户 {character_id}:{user_id} 年索引生成失败: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"[MemoryScheduler] 年索引生成任务失败: {e}")
@@ -414,7 +706,8 @@ class MemoryScheduler:
                 }
                 db_messages.append(db_msg)
 
-            record_ids = await batch_insert_chat_messages(db_messages)
+            chat_repo = get_chat_repo()
+            record_ids = await chat_repo.batch_insert(db_messages)
             await buffer.clear_persistent_queue()
 
             return len(record_ids)

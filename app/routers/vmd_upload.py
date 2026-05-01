@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List
 
-from app.database import get_db
+from app.stone import get_database, get_db_session
 from app.services.vmd_upload_service import vmd_upload_service
 from pydantic import BaseModel
 
@@ -69,7 +69,7 @@ async def upload_vmd(
     vmd_file: UploadFile = File(..., description="VMD动作文件"),
     video_file: UploadFile = File(..., description="预览视频文件"),
     text_prompt: str = Form(..., description="生成文本描述"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db_session)
 ):
     """
     上传VMD和视频文件，自动进行视频分析和标签生成
@@ -126,7 +126,7 @@ async def upload_vmd(
 async def regenerate_analysis(
     upload_id: str,
     request: RegenerateRequest = RegenerateRequest(),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db_session)
 ):
     """
     重新生成AI分析结果
@@ -162,7 +162,7 @@ async def regenerate_analysis(
 async def confirm_save(
     upload_id: str,
     request: ConfirmRequest = ConfirmRequest(),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db_session)
 ):
     """
     确认保存，将VMD数据入库
@@ -202,7 +202,7 @@ async def confirm_save(
 @router.get("/upload/{upload_id}")
 async def get_upload_status(
     upload_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db_session)
 ):
     """
     获取上传状态和AI分析结果
@@ -235,7 +235,7 @@ async def get_upload_status(
 @router.delete("/upload/{upload_id}")
 async def delete_upload(
     upload_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db_session)
 ):
     """
     删除上传的临时文件

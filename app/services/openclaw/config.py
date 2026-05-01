@@ -54,8 +54,8 @@ class OpenClawSessionConfig:
 @dataclass
 class OpenClawRedisConfig:
     """Redis 配置"""
-    # Redis 连接 URL
-    redis_url: str = "redis://localhost:6379/1"  # 使用 DB1 避免与主服务冲突
+    # Redis 连接 URL（None 表示从主配置 settings.REDIS_URL 读取）
+    redis_url: Optional[str] = None
 
     # 任务记录过期时间（秒）
     task_ttl: int = 3600  # 1 小时
@@ -121,7 +121,7 @@ class OpenClawServiceConfig:
             identity_file = getattr(settings, "OPENCLAW_IDENTITY_FILE",
                                     str(Path.home() / ".openclaw" / "pipecat_identity.json"))
 
-            redis_url = getattr(settings, "REDIS_URL", "redis://localhost:6379/1")
+            redis_url = getattr(settings, "REDIS_URL", None)
 
             # 支持从主配置读取 session 数量
             max_sessions = getattr(settings, "OPENCLAW_MAX_SESSIONS", 2)
@@ -179,7 +179,7 @@ class OpenClawServiceConfig:
         ws_token = os.getenv("OPENCLAW_WS_TOKEN", "")
         identity_file = os.getenv("OPENCLAW_IDENTITY_FILE",
                                   str(Path.home() / ".openclaw" / "pipecat_identity.json"))
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/1")
+        redis_url = os.getenv("REDIS_URL", None)
 
         # 支持从环境变量读取 session 数量
         max_sessions = int(os.getenv("OPENCLAW_MAX_SESSIONS", "2"))

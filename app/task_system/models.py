@@ -202,13 +202,20 @@ class BroadcastContent:
     Attributes:
         task_id: 任务 ID
         content: 最终台词（二次改写后）
-        panel_html: 最终 Panel（位置处理后）
+        panel_html: 最终 Panel（位置处理后，仅实时流使用）
         action: 可选动作
+        source_channel: 来源渠道 ("realtime" 或 "im")
+        channel_id: 目标 Channel ID（IM 渠道使用）
+        user_id: 目标用户 ID（IM 渠道使用）
     """
     task_id: str
     content: str
-    panel_html: Optional[Dict[str, Any]] = None
+    panel_html: Optional[Dict[str, Any]] = None  # 仅实时流使用
     action: Optional[str] = None  # ⭐ 原始 <a>...</a> 字符串
+    # ⭐ 新增：渠道信息
+    source_channel: str = "realtime"  # 来源渠道：realtime / im
+    channel_id: Optional[str] = None  # 目标 Channel ID（IM 用）
+    user_id: Optional[str] = None     # 目标用户 ID（IM 用）
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（用于播报队列）"""
@@ -217,6 +224,9 @@ class BroadcastContent:
             "content": self.content,
             "panel_html": self.panel_html,
             "action": self.action,
+            "source_channel": self.source_channel,
+            "channel_id": self.channel_id,
+            "user_id": self.user_id,
         }
     
     @classmethod
@@ -227,6 +237,9 @@ class BroadcastContent:
             content=data.get("content", ""),
             panel_html=data.get("panel_html"),
             action=data.get("action"),
+            source_channel=data.get("source_channel", "realtime"),
+            channel_id=data.get("channel_id"),
+            user_id=data.get("user_id"),
         )
     
     def to_playback_task(self) -> Dict[str, Any]:

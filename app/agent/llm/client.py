@@ -16,7 +16,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Optional
 
 from app.config import settings
-from app.agent.llm.providers import create_llm_provider, BaseLLMProvider
+from app.providers.llm import create_llm_provider, BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,18 @@ class LLMClient:
     """
 
     def __init__(self):
-        self.base_url = settings.LLM_API_BASE_URL
-        self.api_key = settings.LLM_API_KEY or ""
-        self.model = settings.LLM_MODEL
-        self.fast_model = settings.LLM_FAST_MODEL or self.model
+        # 根据 CHAT_PROVIDER 选择器获取配置
+        provider = settings.CHAT_PROVIDER
+        if provider == "cerebras":
+            self.base_url = settings.CEREBRAS_API_BASE_URL or ""
+            self.api_key = settings.CEREBRAS_API_KEY or ""
+            self.model = settings.CHAT_MODEL or settings.CEREBRAS_MODEL
+        else:  # litellm (default)
+            self.base_url = settings.LITELLM_API_BASE_URL
+            self.api_key = settings.LITELLM_API_KEY or ""
+            self.model = settings.CHAT_MODEL or settings.LITELLM_MODEL
+        
+        self.fast_model = self.model  # 暂不区分 fast model
 
         # 创建 Provider（根据配置自动选择）
         self._provider: BaseLLMProvider | None = None

@@ -15,9 +15,8 @@ from typing import Optional
 from sqlalchemy import select, and_
 
 from app.agent.memory.embedding import get_embedding
-from app.database import get_db_session
-from app.models.motion import Motion
-from app.models.tag import MotionTag, MotionTagMap
+from app.stone import get_database
+from app.stone.models.motion import motion, motion_tag, motion_tag_map
 
 logger = logging.getLogger(__name__)
 

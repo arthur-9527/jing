@@ -26,25 +26,17 @@ from app.agent.memory.prompts import (
     format_monthly_index_prompt,
     format_annual_index_prompt,
 )
-from app.agent.db.memory_models import (
-    # 日记相关
-    get_recent_chat_messages,
-    get_recent_key_events,
-    get_recent_heartbeat_events,
-    upsert_daily_diary,
-    get_daily_diary,
-    get_recent_daily_diaries,
-    # 周索引相关
-    insert_weekly_index,
-    get_weekly_index_by_date,
-    # 月索引相关
-    insert_monthly_index,
-    get_monthly_index,
-    # 年索引相关
-    insert_annual_index,
-    get_annual_index,
+from app.stone import (
+    get_chat_repo,
+    get_key_event_repo,
+    get_heartbeat_repo,
+    get_diary_repo,
+    get_weekly_repo,
+    get_monthly_repo,
+    get_annual_repo,
+    get_daily_life_repo,
 )
-from app.services.local_embedding import get_embedding
+from app.agent.memory.embedding import get_embedding
 
 
 class MemoryGenerator:
@@ -103,79 +95,82 @@ class MemoryGenerator:
         
         t0 = datetime.now()
         
-        # 1. 获取当天的聊天记录
-        chat_messages = await get_recent_chat_messages(
-            character_id=character_id,
-            user_id=user_id,
-            limit=100,
-            days=1,  # 只获取当天的
-        )
-        
-        # 过滤出目标日期的消息（注意数据库存储的是 UTC 时间）
-        # 本地日期 target_date 对应的 UTC 时间范围
+        # 计算目标日期对应的 UTC 时间范围
         tz_shanghai = timezone(timedelta(hours=8))
-        
-        # 将本地日期转换为 UTC 时间范围
         local_start = datetime.combine(target_date, datetime.min.time(), tzinfo=tz_shanghai)
         local_end = datetime.combine(target_date, datetime.max.time(), tzinfo=tz_shanghai)
+        target_start = local_start.astimezone(timezone.utc)
+        target_end = local_end.astimezone(timezone.utc)
+
+        # 使用 Stone Repository
+        chat_repo = get_chat_repo()
+        key_event_repo = get_key_event_repo()
+        heartbeat_repo = get_heartbeat_repo()
+        diary_repo = get_diary_repo()
         
-        # 转换为 UTC
-        target_datetime_start = local_start.astimezone(timezone.utc)
-        target_datetime_end = local_end.astimezone(timezone.utc)
-        
-        day_messages = [
-            msg for msg in chat_messages
-            if target_datetime_start <= msg.get("created_at", datetime.min.replace(tzinfo=timezone.utc)) <= target_datetime_end
-        ]
-        
-        if not day_messages:
+        # 1. 获取当天的聊天记录
+        chat_messages = await chat_repo.get_by_date_range(
+            character_id=character_id,
+            user_id=user_id,
+            start_time=target_start,
+            end_time=target_end,
+            limit=100,
+        )
+
+        if not chat_messages:
             logger.warning(f"[MemoryGenerator] {target_date} 没有聊天记录，跳过日记生成")
             return None
-        
-        logger.info(f"[MemoryGenerator] 获取到 {len(day_messages)} 条聊天记录")
-        
+
+        logger.info(f"[MemoryGenerator] 获取到 {len(chat_messages)} 条聊天记录")
+
         # 2. 获取当天的关键事件
-        key_events = await get_recent_key_events(
+        key_events = await key_event_repo.get_by_date_range(
             character_id=character_id,
             user_id=user_id,
-            days=1,
+            start_time=target_start,
+            end_time=target_end,
             limit=50,
         )
-        
-        # 过滤目标日期
-        day_key_events = [
-            evt for evt in key_events
-            if evt.get("created_at", datetime.min.replace(tzinfo=timezone.utc)).date() == target_date
-        ]
-        
-        logger.info(f"[MemoryGenerator] 获取到 {len(day_key_events)} 条关键事件")
-        
+        logger.info(f"[MemoryGenerator] 获取到 {len(key_events)} 条关键事件")
+
         # 3. 获取当天的心动事件
-        heartbeat_events = await get_recent_heartbeat_events(
+        heartbeat_events = await heartbeat_repo.get_by_date_range(
+            character_id=character_id,
+            user_id=user_id,
+            start_time=target_start,
+            end_time=target_end,
+            limit=50,
+        )
+        logger.info(f"[MemoryGenerator] 获取到 {len(heartbeat_events)} 条心动事件")
+        # 4. 获取当天的日常事务事件
+        daily_life_repo = get_daily_life_repo()
+        daily_life_events = await daily_life_repo.get_recent(
             character_id=character_id,
             user_id=user_id,
             days=1,
-            limit=50,
+            limit=20,
         )
         
         # 过滤目标日期
-        day_heartbeat = [
-            evt for evt in heartbeat_events
-            if evt.get("created_at", datetime.min.replace(tzinfo=timezone.utc)).date() == target_date
+        day_daily_life = [
+            evt for evt in daily_life_events
+            if evt.get("event_time", datetime.min.replace(tzinfo=timezone.utc)).date() == target_date
         ]
         
-        logger.info(f"[MemoryGenerator] 获取到 {len(day_heartbeat)} 条心动事件")
+        logger.info(f"[MemoryGenerator] 获取到 {len(day_daily_life)} 条日常事务事件")
         
-        # 4. 格式化对话摘要
-        conversation_summary = self._format_conversation_summary(day_messages)
-        key_events_text = self._format_key_events(day_key_events)
-        heartbeat_text = self._format_heartbeat_events(day_heartbeat)
+        # 5. 格式化对话摘要
+        conversation_summary = self._format_conversation_summary(chat_messages)
+        key_events_text = self._format_key_events(key_events)
+        heartbeat_text = self._format_heartbeat_events(heartbeat_events)
+        daily_life_text = self._format_daily_life_events(daily_life_events)
         
-        # 5. LLM 生成日记
+        # 6. LLM 生成日记
         prompt = format_diary_prompt(
             conversation_summary=conversation_summary,
             key_events=key_events_text,
             heartbeat_events=heartbeat_text,
+            daily_life_events=daily_life_text,
         )
         
         try:
@@ -200,11 +195,11 @@ class MemoryGenerator:
             embedding = None
         
         # 7. 写入数据库
-        key_event_ids = [evt["id"] for evt in day_key_events]
-        heartbeat_ids = [evt["id"] for evt in day_heartbeat]
-        message_ids = [msg["id"] for msg in day_messages]
-        
-        diary_id = await upsert_daily_diary(
+        key_event_ids = [evt["id"] for evt in key_events]
+        heartbeat_ids = [evt["id"] for evt in heartbeat_events]
+        message_ids = [msg["id"] for msg in chat_messages]
+
+        diary_id = await diary_repo.insert(
             character_id=character_id,
             user_id=user_id,
             diary_date=target_date,
@@ -213,7 +208,7 @@ class MemoryGenerator:
             key_event_ids=key_event_ids,
             heartbeat_ids=heartbeat_ids,
             source_message_ids=message_ids,
-            highlight_count=len(day_heartbeat),
+            highlight_count=len(heartbeat_events),
         )
         
         elapsed = (datetime.now() - t0).total_seconds() * 1000
@@ -250,12 +245,16 @@ class MemoryGenerator:
         
         t0 = datetime.now()
         
+        # 使用 Stone Repository
+        diary_repo = get_diary_repo()
+        weekly_repo = get_weekly_repo()
+        
         # 1. 获取本周的日记
-        diaries = await get_recent_daily_diaries(
+        diaries = await diary_repo.get_recent(
             character_id=character_id,
             user_id=user_id,
-            days=14,  # 获取最近两周
             limit=14,
+            days=14,
         )
         
         # 过滤出本周的日记
@@ -299,7 +298,7 @@ class MemoryGenerator:
         # 5. 写入数据库
         diary_ids = [d["id"] for d in week_diaries]
         
-        weekly_id = await insert_weekly_index(
+        weekly_id = await weekly_repo.insert(
             character_id=character_id,
             user_id=user_id,
             week_start=week_start,
@@ -357,15 +356,19 @@ class MemoryGenerator:
         else:
             month_end = date(year, month + 1, 1) - timedelta(days=1)
         
+        # 使用 Stone Repository
+        weekly_repo = get_weekly_repo()
+        monthly_repo = get_monthly_repo()
+        
         # 查询本月所有周索引
         # 这里简化处理：通过日期范围查询
         weekly_indices = []
         current = month_start
         while current <= month_end:
-            weekly = await get_weekly_index_by_date(
+            weekly = await weekly_repo.get_by_week(
                 character_id=character_id,
                 user_id=user_id,
-                target_date=current,
+                week_start=current,
             )
             if weekly and weekly not in weekly_indices:
                 weekly_indices.append(weekly)
@@ -406,7 +409,7 @@ class MemoryGenerator:
         # 5. 写入数据库
         weekly_ids = [w["id"] for w in weekly_indices]
         
-        monthly_id = await insert_monthly_index(
+        monthly_id = await monthly_repo.insert(
             character_id=character_id,
             user_id=user_id,
             year=year,
@@ -444,10 +447,14 @@ class MemoryGenerator:
         
         t0 = datetime.now()
         
+        # 使用 Stone Repository
+        monthly_repo = get_monthly_repo()
+        annual_repo = get_annual_repo()
+        
         # 1. 获取本年的月索引
         monthly_indices = []
         for month in range(1, 13):
-            monthly = await get_monthly_index(
+            monthly = await monthly_repo.get_by_month(
                 character_id=character_id,
                 user_id=user_id,
                 year=year,
@@ -491,7 +498,7 @@ class MemoryGenerator:
         # 5. 写入数据库
         monthly_ids = [m["id"] for m in monthly_indices]
         
-        annual_id = await insert_annual_index(
+        annual_id = await annual_repo.insert(
             character_id=character_id,
             user_id=user_id,
             year=year,
@@ -543,6 +550,30 @@ class MemoryGenerator:
             trigger = evt.get("trigger_text", "")
             intensity = evt.get("intensity", 0)
             lines.append(f"- [{node}] {trigger} (强度: {intensity:.2f})")
+        
+        return "\n".join(lines)
+    
+    def _format_daily_life_events(self, events: list[dict]) -> str:
+        """格式化日常事务事件"""
+        if not events:
+            return "无"
+        
+        lines = []
+        for evt in events:
+            time_str = evt.get("event_time", "")
+            if hasattr(time_str, 'strftime'):
+                time_str = time_str.strftime("%H:%M")
+            scenario = evt.get("scenario", "")
+            detail = evt.get("scenario_detail", "")
+            dialogue = evt.get("dialogue", "")
+            
+            # 组合格式
+            event_line = f"- [{time_str}] {scenario}"
+            if detail:
+                event_line += f": {detail}"
+            if dialogue:
+                event_line += f" 「{dialogue}」"
+            lines.append(event_line)
         
         return "\n".join(lines)
 

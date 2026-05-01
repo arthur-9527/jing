@@ -1,4 +1,7 @@
-"""标签目录服务 - 预加载所有 action 和 emotion 标签"""
+"""标签目录服务 - 预加载所有 action 和 emotion 标签
+
+使用 Stone 数据层
+"""
 
 from __future__ import annotations
 
@@ -8,12 +11,11 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, exists
 
 from app.agent.memory.embedding import get_embedding
-from app.database import get_db_session
-from app.models.tag import MotionTag, MotionTagMap
-from app.models.motion import Motion
+from app.stone import get_database
+from app.stone.models.motion import motions, motion_tags, motion_tag_map
 
 if TYPE_CHECKING:
     from app.agent.character.loader import CharacterConfig
@@ -25,7 +27,7 @@ MATCH_THRESHOLD = 0.5
 MAX_CANDIDATES = 5
 # emotion 匹配加分
 EMOTION_BONUS = 0.2
-# 筛选差距容限（低于最高分超过此值则被排除）
+# 篩选差距容限（低于最高分超过此值则被排除）
 SCORE_GAP_THRESHOLD = 0.1
 
 
@@ -58,11 +60,12 @@ class TagCatalogService:
             if self._initialized:
                 return
 
-            async with get_db_session() as session:
+            db = get_database()
+            async with db.get_session() as session:
                 # 加载所有 action 标签
                 action_result = await session.execute(
-                    select(MotionTag.tag_name, MotionTag.embedding)
-                    .where(MotionTag.tag_type == "action")
+                    select(motion_tags.c.tag_name, motion_tags.c.embedding)
+                    .where(motion_tags.c.tag_type == "action")
                 )
                 for name, emb in action_result:
                     if name:
@@ -72,8 +75,8 @@ class TagCatalogService:
 
                 # 加载所有 emotion 标签
                 emotion_result = await session.execute(
-                    select(MotionTag.tag_name, MotionTag.embedding)
-                    .where(MotionTag.tag_type == "emotion")
+                    select(motion_tags.c.tag_name, motion_tags.c.embedding)
+                    .where(motion_tags.c.tag_type == "emotion")
                 )
                 for name, emb in emotion_result:
                     if name:
@@ -143,40 +146,41 @@ class TagCatalogService:
             return None
 
         # 查询候选动作（只按 action 筛选，不按 emotion 筛选）
-        async with get_db_session() as session:
+        db = get_database()
+        async with db.get_session() as session:
             # 构建查询：必须匹配 action 标签，且 system 标签必须是 "others"
             stmt = (
                 select(
-                    Motion.id,
-                    Motion.display_name,
-                    Motion.description,
-                    Motion.original_duration,
-                    Motion.embedding,
+                    motions.c.id,
+                    motions.c.display_name,
+                    motions.c.description,
+                    motions.c.original_duration,
+                    motions.c.embedding,
                 )
-                .where(Motion.status == "active")
-                .join(MotionTagMap, MotionTagMap.motion_id == Motion.id)
-                .join(MotionTag, MotionTagMap.tag_id == MotionTag.id)
+                .where(motions.c.status == "active")
+                .join(motion_tag_map, motion_tag_map.c.motion_id == motions.c.id)
+                .join(motion_tags, motion_tag_map.c.tag_id == motion_tags.c.id)
                 .where(
                     and_(
-                        MotionTag.tag_type == "action",
-                        MotionTag.tag_name == action,
+                        motion_tags.c.tag_type == "action",
+                        motion_tags.c.tag_name == action,
                     )
                 )
             )
 
             # 必须有 system="others" 标签（排除 idle 等系统动作）
             system_subq = (
-                select(MotionTagMap.motion_id)
-                .join(MotionTag, MotionTagMap.tag_id == MotionTag.id)
+                select(motion_tag_map.c.motion_id)
+                .join(motion_tags, motion_tag_map.c.tag_id == motion_tags.c.id)
                 .where(
                     and_(
-                        MotionTagMap.motion_id == Motion.id,
-                        MotionTag.tag_type == "system",
-                        MotionTag.tag_name == "others",
+                        motion_tag_map.c.motion_id == motions.c.id,
+                        motion_tags.c.tag_type == "system",
+                        motion_tags.c.tag_name == "others",
                     )
                 )
             )
-            stmt = stmt.where(system_subq.exists())
+            stmt = stmt.where(exists(system_subq))
 
             stmt = stmt.limit(MAX_CANDIDATES)
             result = await session.execute(stmt)
@@ -202,15 +206,15 @@ class TagCatalogService:
             # 检查该动作是否有匹配的 emotion 标签
             has_emotion_match = False
             if emotion_match:
-                async with get_db_session() as session:
+                async with db.get_session() as session:
                     emotion_check = await session.execute(
-                        select(MotionTagMap.id)
-                        .join(MotionTag, MotionTagMap.tag_id == MotionTag.id)
+                        select(motion_tag_map.c.id)
+                        .join(motion_tags, motion_tag_map.c.tag_id == motion_tags.c.id)
                         .where(
                             and_(
-                                MotionTagMap.motion_id == mid,
-                                MotionTag.tag_type == "emotion",
-                                MotionTag.tag_name == emotion,
+                                motion_tag_map.c.motion_id == mid,
+                                motion_tags.c.tag_type == "emotion",
+                                motion_tags.c.tag_name == emotion,
                             )
                         )
                     )

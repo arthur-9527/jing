@@ -11,7 +11,7 @@ import json
 import re
 import logging
 
-from app.services.agent_service import get_agent_service
+from app.realtime.agent_service import get_agent_service
 from app.services.tag_catalog_service import get_tag_catalog_service
 
 logger = logging.getLogger(__name__)

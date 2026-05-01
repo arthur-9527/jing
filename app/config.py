@@ -11,69 +11,63 @@ class Settings(BaseSettings):
     # 不要在代码里硬编码账号密码；请通过 .env / 环境变量提供
     DATABASE_URL: str = "postgresql+asyncpg://postgres@localhost:5432/agent_backend"
 
-    # ========== DashScope 配置 ==========
+    # ========== DashScope 配置（ASR/TTS 共用）==========
     DASHSCOPE_API_KEY: Optional[str] = None
 
-    # ========== LLM Provider 配置 ==========
-    LLM_PROVIDER: str = "litellm"  # litellm 或 cerebras
+    # ========== Provider 配置 ==========
+    # LiteLLM Provider（OpenAI 兼容 API）
+    LITELLM_API_BASE_URL: str = "http://127.0.0.1:4000/v1"
+    LITELLM_API_KEY: Optional[str] = None
+    LITELLM_MODEL: str = "qwen3-chat"
 
-    # ========== LLM API 配置 (Agent 用 - LiteLLM Provider) ==========
-    LLM_API_BASE_URL: str = "http://127.0.0.1:4000/v1"
-    LLM_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "qwen3.5-35b"
-    LLM_FAST_MODEL: Optional[str] = None
-
-    # ========== Cerebras SDK 配置 ==========
+    # Cerebras Provider（Cerebras SDK）
+    CEREBRAS_API_BASE_URL: Optional[str] = None
     CEREBRAS_API_KEY: Optional[str] = None
-    CEREBRAS_API_BASE_URL: Optional[str] = None  # 自定义 API 端点（用于中转）
     CEREBRAS_MODEL: str = "llama3.1-8b"
-    CEREBRAS_FAST_MODEL: Optional[str] = None
 
-    # ========== 任务系统配置（新系统）==========
-    # 任务系统总开关
+    # ========== 服务 Provider 选择器 ==========
+    # Chat 服务（纯粹聊天对话）
+    CHAT_PROVIDER: str = "litellm"  # litellm / cerebras
+    CHAT_MODEL: Optional[str] = None  # 可选覆盖，None 则用 Provider 默认模型
+
+    # Thinking 服务（需要思考/高精准度，预留）
+    THINKING_PROVIDER: str = "litellm"
+    THINKING_MODEL: Optional[str] = None
+
+    # Vision 服务（多模态视觉处理）
+    VISION_PROVIDER: str = "litellm"
+    VISION_API_BASE_URL: Optional[str] = None
+    VISION_API_KEY: Optional[str] = None
+    VISION_MODEL: Optional[str] = None
+
+    # Vision 视觉能力配置
+    # none: 不支持视觉
+    # image: 支持图片分析
+    # video: 支持视频分析（同时支持图片）
+    VISION_MODEL_TYPE: str = "none"
+
+    # ========== 二次改写配置 ==========
+    # 二次改写使用 CHAT_PROVIDER + CHAT_MODEL，无需额外配置
+    POST_PROCESS_ENABLED: bool = True
+    POST_PROCESS_TIMEOUT: float = 60.0
+
+    # ========== 任务系统配置 ==========
     TASK_SYSTEM_ENABLED: bool = True
     
     # ========== OpenClaw Provider 配置 ==========
-    # OpenClaw Provider 开关
     OPENCLAW_ENABLED: bool = True
-    # WebSocket 网关地址
     OPENCLAW_WS_URL: str = "ws://127.0.0.1:18789/gateway"
-    # WebSocket Token（默认使用 API_KEY）
     OPENCLAW_WS_TOKEN: Optional[str] = None
-    # Ed25519 设备身份文件路径（用于认证，可选）
     OPENCLAW_IDENTITY_FILE: Optional[str] = None
-    # Session Keys（逗号分隔，替代 OPENCLAW_MAX_SESSIONS）
     OPENCLAW_SESSION_KEYS: str = "agent:main:chat1,agent:main:chat2"
-    # 任务超时时间（秒）
     OPENCLAW_TIMEOUT: float = 300.0
-    # 启动时清空队列
     OPENCLAW_CLEAR_QUEUE_ON_START: bool = True
 
-    # ========== 二次改写配置（新系统）==========
-    # 二次改写开关
-    POST_PROCESS_ENABLED: bool = True
-    # LLM Provider（litellm 使用 OpenAI 兼容 API，cerebras 使用 Cerebras SDK）
-    POST_PROCESS_PROVIDER: str = "litellm"
-    # 改写模型名称
-    POST_PROCESS_MODEL: str = "qwen3-chat"
-    # API Base URL（litellm 模式，复用主 LLM 配置）
-    POST_PROCESS_BASE_URL: str = ""
-    # API Key（可选，默认使用 LLM_API_KEY）
-    POST_PROCESS_API_KEY: str = ""
-    # 改写超时（秒）
-    POST_PROCESS_TIMEOUT: float = 60.0
-
-    # ========== HTTP Provider 配置（未来扩展）==========
-    HTTP_PROVIDER_ENABLED: bool = False
-    HTTP_PROVIDER_URL: str = ""
-    HTTP_PROVIDER_API_KEY: str = ""
-
     # ========== Redis 配置 ==========
-    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_URL: str = "redis://localhost:6379/1"
 
     # ========== Embedding 配置 (本地模型) ==========
     # 模型路径必须通过环境变量 LOCAL_EMBEDDING_MODEL_PATH 配置
-    LOCAL_EMBEDDING_ENABLED: bool = True
     LOCAL_EMBEDDING_MODEL_PATH: str = ""  # 必须在 .env 中配置，如：models/embedding 或 /app/models/embedding
     EMBEDDING_DIM: int = 512  # bge-small-zh-v1.5 输出 512 维
     EMBEDDING_CACHE_TTL: int = 300  # 缓存 TTL（秒）
@@ -84,10 +78,6 @@ class Settings(BaseSettings):
     CHARACTER_CONFIG_PATH: str = "config/characters/daji"  # 角色配置目录路径（不含扩展名）
     CONVERSATION_WINDOW_SIZE: int = 10
     EMOTION_INTENSITY_THRESHOLD: float = 0.3
-
-    # ========== 动作解析配置 ==========
-    ACTION_PARSE_TIMEOUT: float = 8.0
-    ACTION_PARSE_USE_FAST: bool = True
 
     # 服务器配置
     HOST: str = "0.0.0.0"
@@ -102,14 +92,9 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # ========== ASR Provider 配置 ==========
-    ASR_PROVIDER: str = "qwen"  # deepgram 或 qwen
+    ASR_PROVIDER: str = "qwen"
 
-    # Deepgram ASR
-    DEEPGRAM_API_KEY: Optional[str] = None
-    DEEPGRAM_ASR_MODEL: str = "nova-2-general"
-    DEEPGRAM_ASR_LANGUAGE: str = "zh-CN"
-
-    # 千问 ASR (Qwen ASR)
+    # Qwen ASR
     QWEN_ASR_MODEL: str = "qwen3-asr-flash-realtime"
     QWEN_ASR_LANGUAGE: str = "zh"
     QWEN_ASR_ENABLE_VAD: bool = True
@@ -117,18 +102,13 @@ class Settings(BaseSettings):
     QWEN_ASR_VAD_SILENCE_MS: int = 400
 
     # ========== TTS Provider 配置 ==========
-    TTS_PROVIDER: str = "cosyvoice_ws"  # cartesia 或 cosyvoice_ws
+    TTS_PROVIDER: str = "cosyvoice"
 
-    # CosyVoice WebSocket TTS
-    COSYVOICE_WS_MODEL: str = "cosyvoice-v3-flash"
-    COSYVOICE_WS_CLONE_AUDIO: Optional[str] = None  # 克隆音色音频文件路径（如 "temp/wendi.mp3"）
-
-    # Cartesia TTS
-    CARTESIA_API_KEY: Optional[str] = None
-    CARTESIA_VOICE_ID: Optional[str] = None
-    CARTESIA_MODEL: str = "sonic-3"
-    CARTESIA_LANGUAGE: str = "zh"
-    CARTESIA_SAMPLE_RATE: int = 22050
+    # CosyVoice TTS
+    COSYVOICE_MODEL: str = "cosyvoice-v3-flash"
+    # 音色配置（二选一，优先 voice_id）
+    COSYVOICE_VOICE_ID: Optional[str] = None   # 直接指定音色 ID（如 "cosyvoice-v3-flash-xxx")
+    COSYVOICE_CLONE_AUDIO: Optional[str] = None  # 克隆音频路径（自动转换为 voice_id）
 
     # ========== 音频配置 ==========
     AUDIO_SAMPLE_RATE: int = 16000
@@ -139,10 +119,6 @@ class Settings(BaseSettings):
     # 如需指定特定设备（如 ESP32 USB 麦克风），可通过 .env 配置具体索引
     AUDIO_INPUT_DEVICE_INDEX: Optional[int] = None   # 输入设备索引（麦克风）
     AUDIO_OUTPUT_DEVICE_INDEX: Optional[int] = None  # 输出设备索引（扬声器）
-
-    # ========== Panel 屏幕配置 ==========
-    SCREEN_WIDTH: int = 1920      # 屏幕/窗口宽度（像素）
-    SCREEN_HEIGHT: int = 1080     # 屏幕/窗口高度（像素）
 
     # ========== 帧推送配置 ==========
     FRAME_TARGET_FPS: int = 30
@@ -185,14 +161,62 @@ class Settings(BaseSettings):
     VMD_UPLOAD_TEMP_DIR: str = "/tmp/vmd_uploads"
     VMD_UPLOAD_TTL_HOURS: int = 24
 
-    # ========== 多模态 LLM 配置 (Vision) ==========
-    VISION_LLM_API_BASE_URL: str = "http://127.0.0.1:4000/v1"
-    VISION_LLM_API_KEY: Optional[str] = None
-    VISION_LLM_MODEL: str = "gpt-4o"
+    # ========== QQ Bot 配置 ==========
+    QQ_BOT_APPID: str = ""  # QQ Bot AppID
+    QQ_BOT_SECRET: str = ""  # QQ Bot AppSecret
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # ========== Media Gen (图片/视频生成) 配置 ==========
+    # 图片/视频生成功能开关
+    IMAGE_VIDEO_GEN_ENABLED: bool = False  # 启用后，系统可以生成图片和视频
+    
+    # 参考图片路径（用于图生图和图生视频）
+    # 路径与克隆声音音频路径一致（如：config/characters/daji/youla.jpg）
+    IMAGE_VIDEO_GEN_REFERENCE_IMAGE_PATH: Optional[str] = None
+
+    # ========== Image Gen Provider 配置 ==========
+    # 图片生成 Provider（仅支持图生图模式）
+    IMAGE_GEN_PROVIDER: str = "dashscope"  # dashscope / stability / openai
+
+    # DashScope 图片生成模型
+    # 要求：必须支持图生图能力 + base64 格式输入
+    # 推荐值: wanx2.1-t2i-plus（需确认服务商是否支持图生图）
+    DASHSCOPE_IMAGE_GEN_MODEL: str = "wanx2.1-t2i-plus"
+    DASHSCOPE_IMAGE_GEN_DEFAULT_SIZE: str = "1024*1024"  # 默认图片尺寸
+    DASHSCOPE_IMAGE_GEN_DEFAULT_NUM: int = 1              # 默认生成数量
+
+    # ========== Video Gen Provider 配置 ==========
+    # 视频生成 Provider（仅支持图生视频模式）
+    VIDEO_GEN_PROVIDER: str = "dashscope"  # dashscope / runway / pika
+
+    # DashScope 视频生成模型
+    # 要求：必须支持图生视频能力 + base64 格式输入
+    # 推荐值: wanx2.1-i2v-plus / wanx2.1-i2v-turbo
+    DASHSCOPE_VIDEO_GEN_MODEL: str = "wanx2.1-i2v-plus"
+    DASHSCOPE_VIDEO_GEN_RESOLUTION: str = "720p"  # 默认分辨率
+    DASHSCOPE_VIDEO_GEN_DURATION: float = 5.0     # 默认视频时长（秒）
+
+    # ========== 阿里云 OSS 配置 ==========
+    # OSS 存储功能开关
+    OSS_ENABLED: bool = False
+
+    # OSS 访问凭证
+    OSS_ACCESS_KEY_ID: Optional[str] = None
+    OSS_ACCESS_KEY_SECRET: Optional[str] = None
+
+    # OSS Endpoint（如：oss-cn-hangzhou.aliyuncs.com）
+    OSS_ENDPOINT: Optional[str] = None
+
+    # OSS Bucket 名称
+    OSS_BUCKET_NAME: Optional[str] = None
+
+    # OSS 生命周期天数（文件自动清理）
+    OSS_LIFECYCLE_DAYS: int = 7
+
+    model_config = {
+        "env_file": ".env",
+        "case_sensitive": True,
+        "extra": "ignore",  # 忽略 .env 中旧的/未定义的字段
+    }
 
 
 # 全局配置实例

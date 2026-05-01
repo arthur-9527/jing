@@ -23,18 +23,22 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from app.agent.character.loader import CharacterConfig, load_character
-from app.agent.db.connection import close_pool, init_db
-from app.agent.db.models import get_agent_state, upsert_agent_state
-from app.services.emotion import EmotionService
+from app.stone import init_database, close_database
+from app.stone import get_agent_state_repo
+from app.services.emotion import EmotionService, get_emotion_service, start_emotion_scheduler, stop_emotion_scheduler, EmotionEvent
 from app.agent.llm.client import LLMClient
 from app.agent.llm.unified import generate_unified, generate_unified_stream
 from app.agent.memory.retriever import retrieve_memories, retrieve_short_term_memories
-from app.agent.memory.writer import write_emotion_memory
+from app.agent.memory.writer import write_heartbeat_event
 from app.agent.prompt.system_prompt import build_static_system_prompt, build_dynamic_context
 from app.agent.prompt.tool_rewrite_prompt import build_tool_rewrite_prompt
 from app.config import settings
 from app.services.motion_catalog_service import get_motion_catalog_service
 from app.services.tag_catalog_service import get_tag_catalog_service
+
+# ⭐ 好感度系统（延迟导入避免循环依赖）
+_affection_service = None
+_affection_context_manager = None
 
 # 延迟导入心跳模块避免循环依赖
 _cache_heartbeat = None
@@ -84,8 +88,16 @@ class EmotionalAgent:
         """
         self.config = config
         self.llm = llm_client
-        # 使用新的 EmotionService（物理模拟版）
-        self.emotion = EmotionService(config.emotion_baseline)
+
+        # ⭐ 使用角色级别的 EmotionService 单例（与 IMChannelProcessor 共享实例）
+        # Stone 迁移：使用 EmotionStateRepository 进行持久化
+        from app.stone import get_emotion_repo
+        emotion_repo = get_emotion_repo()
+        self.emotion = get_emotion_service(
+            character_id=config.character_id,
+            baseline=config.emotion_baseline,
+            emotion_repo=emotion_repo,
+        )
         self.turn_count: int = 0
         self._bg_tasks: set[asyncio.Task] = set()
         self.motion_catalog = get_motion_catalog_service()
@@ -105,6 +117,17 @@ class EmotionalAgent:
         # 新任务系统 (TaskSystem) 已在 AgentService.start() 中启动
         # EmotionalAgent 通过 TaskSystem 执行工具调用
         self._task_system = None
+        
+        # ⭐ 好感度系统引用（由 AgentService 在启动时注入）
+        # AffectionService: 三维好感度状态管理
+        # AffectionContextManager: 动态好感度语境生成 + 缓存
+        self._affection_service = None
+        self._affection_context_manager = None
+        
+        # ⭐ 角色人设文本（从 personality.md 加载，用于好感度评估和语境生成）
+        self._personality_text = ""
+        self._emotion_traits_text = ""
+        self._emotion_triggers_text = ""
     
     def _init_cache_heartbeat(self) -> None:
         """初始化缓存心跳机制"""
@@ -187,20 +210,56 @@ class EmotionalAgent:
             return None
 
     async def load_state(self, user_id: str):
-        """从数据库加载对话状态"""
-        state = await get_agent_state(self.config.character_id, user_id)
+        """从 Redis 加载情绪状态
+        
+        ⭐ 改造：情绪状态存储在 Redis: emotion:{character_id}
+        - 角色级别，不包含 user_id
+        - 自动加载（如果 Redis 客户端已配置）
+        - 如果 Redis 无存储，使用基线状态
+        
+        注意：turn_count 仍然从数据库加载（按 user_id）
+        """
+        # ⭐ 从 Redis 加载情绪状态（角色级别，通过 Stone EmotionStateRepository）
+        loaded = await self.emotion.load_state_from_redis()
+        if loaded:
+            logger.info(
+                "[load_state] 已从 Redis 加载情绪状态: character=%s",
+                self.config.character_id
+            )
+        else:
+            logger.info(
+                "[load_state] Redis 无情绪状态，使用基线: character=%s",
+                self.config.character_id
+            )
+        
+        # ⭐ turn_count 仍然从数据库加载（按 user_id）
+        agent_state_repo = get_agent_state_repo()
+        state = await agent_state_repo.get(self.config.character_id, user_id)
         if state:
-            # 使用 EmotionService 恢复状态
-            self.emotion.restore_full_state(state["pad_state"])
             self.turn_count = state.get("turn_count", 0)
-            logger.info("已恢复对话状态，轮次: %d", self.turn_count)
+            logger.info("[load_state] 已恢复对话轮次: turn=%d", self.turn_count)
 
     async def save_state(self, user_id: str):
-        """保存对话状态到数据库"""
-        await upsert_agent_state(
+        """保存状态到 Redis + PostgreSQL
+        
+        ⭐ 改造：
+        - 情绪状态 → Redis: emotion:{character_id}（角色级别）
+        - turn_count → PostgreSQL: agent_state 表（按 user_id）
+        """
+        # ⭐ 情绪状态保存到 Redis（角色级别，通过 Stone EmotionStateRepository）
+        await self.emotion.save_state_to_redis()
+        logger.debug(
+            "[save_state] 已保存情绪状态到 Redis: character=%s",
+            self.config.character_id
+        )
+        
+        # ⭐ turn_count 仍然保存到数据库（按 user_id）
+        # 注意：pad_state 字段保留但不更新（情绪已迁移到 Redis）
+        agent_state_repo = get_agent_state_repo()
+        await agent_state_repo.upsert(
             character_id=self.config.character_id,
             user_id=user_id,
-            pad_state=self.emotion.get_full_state(),
+            pad_state={},  # ⭐ 空字典，情绪已迁移到 Redis
             turn_count=self.turn_count,
         )
 
@@ -311,6 +370,8 @@ class EmotionalAgent:
         action_events: list[dict[str, str | None]] = []
         metadata = None
         tool_prompt = None
+        # ⭐ Bug 修复：收集 emotion_delta，避免 _finalize_turn 拿到零值
+        collected_emotion_delta: dict[str, float] = {"P": 0.0, "A": 0.0, "D": 0.0}
         
         try:
             async for item in generate_unified_stream(
@@ -329,8 +390,11 @@ class EmotionalAgent:
                         logger.info("[EmotionalAgent] 投机模式收到 tool_prompt: %s", tool_prompt)
                         continue
                     
-                    # 处理 emotion_delta 类型（⭐ 立即 yield）
+                    # 处理 emotion_delta 类型（⭐ 立即 yield + 同时收集）
                     if item_type == "emotion_delta":
+                        # ⭐ Bug 修复：收集 emotion_delta，避免 _finalize_turn 拿到零值
+                        collected_emotion_delta = item.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+                        logger.info("[EmotionalAgent] 投机模式收集 emotion_delta: %s", collected_emotion_delta)
                         yield item
                         continue
                     
@@ -381,6 +445,12 @@ class EmotionalAgent:
                     "inner_monologue": "",
                     "motion": None,
                 }
+            
+            # ⭐ Bug 修复：将收集的 emotion_delta 注入到 metadata
+            current_delta = metadata.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+            if current_delta == {"P": 0.0, "A": 0.0, "D": 0.0} and collected_emotion_delta != {"P": 0.0, "A": 0.0, "D": 0.0}:
+                metadata["emotion_delta"] = collected_emotion_delta
+                logger.info("[EmotionalAgent] 投机模式注入收集的 emotion_delta 到 metadata: %s", collected_emotion_delta)
             
             metadata["tool_prompt"] = tool_prompt
             metadata["used_tool"] = False
@@ -474,7 +544,7 @@ class EmotionalAgent:
         静态内容（static_system_prompt）已在初始化时构建，不再变化。
         此方法只构建动态内容：
         - memories: 短期记忆检索（最近聊天、心动时刻、特殊事件）
-        - dynamic_context: 当前 PAD 状态
+        - dynamic_context: 当前 PAD 状态 + 好感度动态语境
         - conversation_history: 对话历史
         """
         import time
@@ -488,10 +558,32 @@ class EmotionalAgent:
         memories = await retrieve_short_term_memories(character_id, user_id, user_input)
         logger.info(f"[Timing] retrieve_short_term_memories: {(time.monotonic()-t1)*1000:.0f}ms")
         
-        # Step 2: 动态上下文（使用新的 EmotionService）
+        # Step 2: 动态上下文（PAD 状态）
         t2 = time.monotonic()
         dynamic_context = build_dynamic_context(self.emotion)
         logger.info(f"[Timing] build_dynamic_context: {(time.monotonic()-t2)*1000:.0f}ms")
+        
+        # ⭐ Step 2.5: 获取好感度动态语境（如果有好感度系统）
+        # 语境描述当前情绪+好感度状态，作为动态上下文注入 User Prompt
+        t_aff = time.monotonic()
+        affection_context = ""
+        if self._affection_context_manager:
+            try:
+                # 注册活跃用户（供好感度语境刷新调度器使用）
+                from app.services.affection.scheduler import register_active_user
+                register_active_user(character_id, user_id)
+
+                affection_context = await self._affection_context_manager.get_affection_context(
+                    character_id=character_id,
+                    user_id=user_id,
+                    emotion_service=self.emotion,
+                )
+                if affection_context:
+                    # 合并到动态上下文
+                    dynamic_context = f"{dynamic_context}\n{affection_context}"
+                    logger.info(f"[Timing] affection_context: {(time.monotonic()-t_aff)*1000:.0f}ms, 语境长度: {len(affection_context)} chars")
+            except Exception as e:
+                logger.warning(f"[EmotionalAgent] 获取好感度语境失败: {e}")
 
         # Step 3: 对话历史
         t3 = time.monotonic()
@@ -507,15 +599,22 @@ class EmotionalAgent:
             "user_input": user_input,
             "memories": memories,
             "system_prompt": self.static_system_prompt,  # 静态，不变
-            "dynamic_context": dynamic_context,           # 动态，每轮变化
+            "dynamic_context": dynamic_context,           # 动态，每轮变化（含好感度语境）
             "conversation_history": conversation_history,  # 动态，每轮变化
+            "affection_context": affection_context,        # ⭐ 新增：单独保存好感度语境（用于后续评估）
         }
     
     async def _get_conversation_history(self, user_id: str) -> str:
-        """从 Redis 读取聊天记录"""
+        """从 Redis 读取聊天记录
+        
+        ⭐ 使用 character_id 实现数据隔离
+        """
         try:
             from app.services.chat_history import get_conversation_buffer
-            buffer = await get_conversation_buffer(user_id)
+            buffer = await get_conversation_buffer(
+                user_id=user_id,
+                character_id=self.config.character_id,  # ⭐ 传递 character_id 实现隔离
+            )
             history = await buffer.get_formatted_history(
                 max_items=10,
                 format_style="user_assistant"
@@ -557,6 +656,8 @@ class EmotionalAgent:
         expression_chunks: list[str] = []
         action_events: list[dict[str, str | None]] = []
         visible_stream_items: list[str | dict[str, Any]] = []
+        # ⭐ Bug 修复：收集 emotion_delta，避免 _finalize_turn 拿到零值
+        collected_emotion_delta: dict[str, float] = {"P": 0.0, "A": 0.0, "D": 0.0}
 
         async for item in generate_unified_stream(
             llm_client=self.llm,
@@ -572,6 +673,12 @@ class EmotionalAgent:
                 if item_type == "tool_prompt":
                     tool_prompt = item.get("tool_prompt")
                     logger.info("[EmotionalAgent] 收到 tool_prompt: %s", tool_prompt)
+                    continue
+                
+                # ⭐ Bug 修复：处理 emotion_delta 类型（收集但不 yield，此路径不推送到 TTS）
+                if item_type == "emotion_delta":
+                    collected_emotion_delta = item.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+                    logger.info("[EmotionalAgent] _generate_first_pass(stream) 收集 emotion_delta: %s", collected_emotion_delta)
                     continue
                     
                 # ⭐ 处理 action_data 类型（新的统一动作处理格式）
@@ -606,6 +713,12 @@ class EmotionalAgent:
                 "motion": None,
             }
         
+        # ⭐ Bug 修复：将收集的 emotion_delta 注入到 metadata
+        current_delta = metadata.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+        if current_delta == {"P": 0.0, "A": 0.0, "D": 0.0} and collected_emotion_delta != {"P": 0.0, "A": 0.0, "D": 0.0}:
+            metadata["emotion_delta"] = collected_emotion_delta
+            logger.info("[EmotionalAgent] _generate_first_pass(stream) 注入 emotion_delta 到 metadata: %s", collected_emotion_delta)
+        
         # ⭐ 新增：将 tool_prompt 合并到 metadata 中（兼容原有逻辑）
         metadata["tool_prompt"] = tool_prompt
 
@@ -638,6 +751,8 @@ class EmotionalAgent:
         tool_prompt = None
         expression_chunks: list[str] = []
         action_events: list[dict[str, str | None]] = []
+        # ⭐ Bug 修复：收集 emotion_delta，避免 _finalize_turn 拿到零值
+        collected_emotion_delta: dict[str, float] = {"P": 0.0, "A": 0.0, "D": 0.0}
         
         async for item in generate_unified_stream(
             llm_client=self.llm,
@@ -656,8 +771,11 @@ class EmotionalAgent:
                     # ⭐ 不 yield tool_prompt，内部收集
                     continue
                 
-                # 处理 emotion_delta 类型（⭐ 立即 yield，设置 TTS 情绪）
+                # 处理 emotion_delta 类型（⭐ 立即 yield，设置 TTS 情绪 + 同时收集）
                 if item_type == "emotion_delta":
+                    # ⭐ Bug 修复：收集 emotion_delta，避免 _finalize_turn 拿到零值
+                    collected_emotion_delta = item.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+                    logger.info("[EmotionalAgent] 收集 emotion_delta: %s", collected_emotion_delta)
                     yield item
                     continue
                 
@@ -701,6 +819,13 @@ class EmotionalAgent:
                 "inner_monologue": "",
                 "motion": None,
             }
+        
+        # ⭐ Bug 修复：将收集的 emotion_delta 注入到 metadata
+        # 如果 metadata 中的 emotion_delta 是零值（从默认值来的），使用收集的值
+        current_delta = metadata.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
+        if current_delta == {"P": 0.0, "A": 0.0, "D": 0.0} and collected_emotion_delta != {"P": 0.0, "A": 0.0, "D": 0.0}:
+            metadata["emotion_delta"] = collected_emotion_delta
+            logger.info("[EmotionalAgent] 注入收集的 emotion_delta 到 metadata: %s", collected_emotion_delta)
         
         # 合并 tool_prompt 到 metadata
         metadata["tool_prompt"] = tool_prompt
@@ -931,12 +1056,24 @@ class EmotionalAgent:
         metadata["expression"] = expression
 
         emotion_delta = metadata.get("emotion_delta", {"P": 0.0, "A": 0.0, "D": 0.0})
-        emotion_intensity = self.emotion.intensity(emotion_delta)
         # 使用 EmotionService 更新（物理模拟）
-        self.emotion.update(emotion_delta)
+        # ⭐ 传入 context，供心动事件回调使用
+        emotion_event = self.emotion.update(
+            emotion_delta,
+            trigger_keywords=metadata.get("trigger_keywords", []),
+            inner_monologue=metadata.get("inner_monologue", ""),
+            context={
+                "character_id": self.config.character_id,
+                "user_id": turn_context["user_id"],
+                "user_input": turn_context.get("user_input", ""),
+                "expression": expression,
+                "metadata": metadata,
+            },
+        )
+        emotion_intensity = emotion_event.intensity
         logger.info(
-            "PAD 更新: %s | delta=%s | intensity=%.3f",
-            self.emotion, emotion_delta, emotion_intensity,
+            "PAD 更新: %s | delta=%s | intensity=%.3f | is_heart_event=%s",
+            self.emotion, emotion_delta, emotion_intensity, emotion_event.is_heart_event,
         )
 
         # 更新轮次计数
@@ -966,7 +1103,7 @@ class EmotionalAgent:
 
     # ⭐ 以下方法已迁移到 app/agent/action/processor.py:
     # - _match_actions
-    # - _match_single_action  
+    # - _match_single_action
     # - _build_action_events_from_expression
 
     async def _write_memories(
@@ -981,11 +1118,14 @@ class EmotionalAgent:
     ):
         """后台写入情绪记忆（用户信息提取由 Redis 批量机制处理）"""
         try:
-            await write_emotion_memory(
+            # ⭐ Bug 修复：传入当前 PAD 状态快照而非 delta
+            # 数据库字段 emotion_state 的语义是"状态快照"，不是"变化量"
+            pad_state = self.emotion.get_state().to_dict()
+            await write_heartbeat_event(
                 character_id=character_id,
                 user_id=user_id,
                 inner_monologue=monologue_result.get("inner_monologue", ""),
-                pad_delta=emotion_delta,
+                pad_state=pad_state,  # ← 修复：使用当前状态快照
                 emotion_intensity=emotion_intensity,
                 trigger_keywords=monologue_result.get("trigger_keywords", []),
             )
@@ -1058,7 +1198,7 @@ async def cli_main():
     logging.getLogger("src.llm.unified").setLevel(logging.DEBUG)
 
     print("正在初始化数据库...")
-    await init_db()
+    await init_database()
 
     config = load_character()
     print(f"角色已加载: {config.name} ({config.character_id})")
@@ -1095,7 +1235,7 @@ async def cli_main():
     finally:
         if agent._bg_tasks:
             await asyncio.gather(*agent._bg_tasks, return_exceptions=True)
-        await close_pool()
+        await close_database()
 
 
 if __name__ == "__main__":

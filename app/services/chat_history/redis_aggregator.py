@@ -102,6 +102,7 @@ class RedisHistoryAggregator(LLMUserAggregator):
         self,
         context: LLMContext,
         user_id: str = "default_user",
+        character_id: str = "default",  # ⭐ 新增：角色标识，用于数据隔离
         conversation_buffer: Optional[ConversationBuffer] = None,
         max_history_items: int = 10,
         system_prompt: str = "",
@@ -114,6 +115,7 @@ class RedisHistoryAggregator(LLMUserAggregator):
         Args:
             context: LLMContext 对象（新版）
             user_id: 用户标识
+            character_id: 角色标识（用于数据隔离）
             conversation_buffer: Redis 缓冲区实例
             max_history_items: 最大历史条目数
             system_prompt: 系统提示词
@@ -124,13 +126,17 @@ class RedisHistoryAggregator(LLMUserAggregator):
         super().__init__(context=context, params=params, **kwargs)
         
         self.user_id = user_id
+        self.character_id = character_id  # ⭐ 保存 character_id
         self.max_history_items = max_history_items
         self.system_prompt = system_prompt
         self.dynamic_context_getter = dynamic_context_getter
         self.memory_context_getter = memory_context_getter
         
-        # 使用提供的 buffer 或创建新的
-        self._buffer = conversation_buffer or ConversationBuffer(user_id=user_id)
+        # 使用提供的 buffer 或创建新的（包含 character_id）
+        self._buffer = conversation_buffer or ConversationBuffer(
+            user_id=user_id,
+            character_id=character_id,  # ⭐ 传递 character_id
+        )
         
         # 标记是否正在处理
         self._is_processing = False
